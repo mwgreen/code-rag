@@ -633,3 +633,39 @@ async def search_async(query: str, n: int = 5, type_filter: Optional[str] = None
                 'distance': hit['distance']
             })
     return formatted
+
+
+async def add_file_async(path: str, force: bool = False, db_path: Optional[str] = None) -> int:
+    """Async add_file for use by file watcher. Uses embed semaphore + write lock."""
+    loop = asyncio.get_event_loop()
+    abs_path = str(Path(path).absolute())
+
+    # Hash check is cheap — do it without locks
+    if not force:
+        needs = await loop.run_in_executor(None,
+            lambda: file_needs_indexing(abs_path, db_path))
+        if not needs:
+            return 0
+
+    # Embedding + DB write needs both semaphore and lock
+    if _embed_semaphore is not None and _write_lock is not None:
+        async with _embed_semaphore:
+            async with _write_lock:
+                return await loop.run_in_executor(None,
+                    lambda: add_file(path, force=force, db_path=db_path))
+    else:
+        return await loop.run_in_executor(None,
+            lambda: add_file(path, force=force, db_path=db_path))
+
+
+async def delete_by_path_async(file_path: str, db_path: Optional[str] = None) -> int:
+    """Async delete_by_path for use by file watcher. Uses write lock."""
+    loop = asyncio.get_event_loop()
+
+    if _write_lock is not None:
+        async with _write_lock:
+            return await loop.run_in_executor(None,
+                lambda: delete_by_path(file_path, db_path))
+    else:
+        return await loop.run_in_executor(None,
+            lambda: delete_by_path(file_path, db_path))

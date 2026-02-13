@@ -98,6 +98,9 @@ pip install --quiet python-dotenv pyyaml
 echo "  Installing tree-sitter (AST chunking)..."
 pip install --quiet "tree-sitter>=0.25.0" "tree-sitter-java>=0.23.0" "tree-sitter-python>=0.25.0" "tree-sitter-typescript>=0.23.0"
 
+echo "  Installing watchdog (file watcher)..."
+pip install --quiet "watchdog>=4.0.0"
+
 echo "  Installing MCP (optional - for Claude Code integration)..."
 pip install --quiet mcp || echo "  MCP install failed (optional, can skip)"
 

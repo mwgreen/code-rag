@@ -9,6 +9,7 @@ from mcp.server import Server
 from mcp import types
 
 import rag_milvus
+import file_watcher
 
 
 # --- Project context ---
@@ -251,14 +252,30 @@ def register_tools(server: Server):
                     "required": []
                 }
             ),
+            types.Tool(
+                name="watcher_status",
+                description="Get file watcher status (pending changes, indexing stats)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            ),
         ]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
             db = get_db_path()
+            project_root = get_current_project_root()
         except ProjectNotConfiguredError as e:
             return [types.TextContent(type="text", text=str(e))]
+
+        # Ensure file watcher is running for this project (best-effort)
+        try:
+            await file_watcher.ensure_watcher(project_root, db)
+        except Exception:
+            pass
 
         try:
             if name == "search_code":
@@ -305,6 +322,25 @@ def register_tools(server: Server):
             elif name == "get_stats":
                 stats = rag_milvus.get_stats(db_path=db)
                 return [types.TextContent(type="text", text=format_stats(stats, db))]
+
+            elif name == "watcher_status":
+                status = file_watcher.get_watcher_status()
+                project_status = status.get(project_root)
+                if project_status is None:
+                    return [types.TextContent(type="text", text="No active file watcher for this project.")]
+                s = project_status['stats']
+                lines = [
+                    f"**File Watcher:** active",
+                    f"**Pending changes:** {project_status['pending']}",
+                    f"**Currently processing:** {project_status['processing']}",
+                    "",
+                    "### Cumulative Stats",
+                    f"- Files indexed: {s['files_indexed']}",
+                    f"- Files deleted: {s['files_deleted']}",
+                    f"- Batches processed: {s['batches_processed']}",
+                    f"- Errors: {s['errors']}",
+                ]
+                return [types.TextContent(type="text", text="\n".join(lines))]
 
             else:
                 raise ValueError(f"Unknown tool: {name}")

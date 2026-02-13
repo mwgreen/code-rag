@@ -26,6 +26,7 @@ from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import rag_milvus
+import file_watcher
 from tools import register_tools, set_current_project_root
 
 # --- Configuration ---
@@ -63,7 +64,17 @@ class ProjectMiddleware:
 # --- Health endpoint ---
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    watcher_status = file_watcher.get_watcher_status()
+    watchers = {}
+    for root, s in watcher_status.items():
+        watchers[Path(root).name] = {
+            "pending": s["pending"],
+            "processing": s["processing"],
+            "files_indexed": s["stats"]["files_indexed"],
+            "files_deleted": s["stats"]["files_deleted"],
+            "batches": s["stats"]["batches_processed"],
+        }
+    return JSONResponse({"status": "ok", "watchers": watchers})
 
 
 # --- Lifespan ---
@@ -94,7 +105,8 @@ async def lifespan(app: Starlette):
         try:
             yield
         finally:
-            pass
+            # Stop file watchers before closing Milvus clients
+            await file_watcher.stop_all_watchers()
 
     # Cleanup
     rag_milvus.close_server_mode()
