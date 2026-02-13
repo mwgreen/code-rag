@@ -20,6 +20,12 @@ models/
 # macOS
 .DS_Store
 
+# Generated config
+mcp-config-template.json
+
+# Data directory
+data/
+
 # Runtime
 *.pid
 *.log

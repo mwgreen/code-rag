@@ -1,6 +1,6 @@
 #!/bin/bash
 # Setup script for code-rag on Apple Silicon Mac
-# Automates installation and verification
+# Single command to install everything: deps, model, and verify.
 
 set -e  # Exit on error
 
@@ -115,28 +115,17 @@ else
 fi
 
 # Create data directory
+mkdir -p data
+
+# Download and quantize embedding model
 echo ""
-echo "Creating data directory..."
-mkdir -p data models
-echo "  data/ and models/ created"
+"$SCRIPT_DIR/download-model.sh"
 
-# Check for embedding model
+# Test installation
 echo ""
-MODEL_DIR="$SCRIPT_DIR/models/qodo-embed-1-1.5b-mlx-q8"
-if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/model.safetensors" ]; then
-    echo "  Qodo-Embed-1-1.5B (Q8) model found at models/qodo-embed-1-1.5b-mlx-q8/"
-else
-    echo "  Embedding model not found at models/qodo-embed-1-1.5b-mlx-q8/"
-    echo "   Run ./download-model.sh to download from HuggingFace and quantize to Q8."
-    echo "   (Downloads ~5.8GB, quantizes to ~1.6GB)"
-fi
+echo "Testing installation..."
 
-# Test installation (only if model is available)
-if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/model.safetensors" ]; then
-    echo ""
-    echo "Testing installation..."
-
-    python3 << 'PYEOF'
+python3 << 'PYEOF'
 import sys
 sys.path.insert(0, '.')
 
@@ -164,13 +153,9 @@ print("")
 print("  All tests passed!")
 PYEOF
 
-    if [ $? -ne 0 ]; then
-        echo "Installation test failed"
-        exit 1
-    fi
-else
-    echo ""
-    echo "  Skipping tests (model not available)"
+if [ $? -ne 0 ]; then
+    echo "Installation test failed"
+    exit 1
 fi
 
 # Generate MCP config template
@@ -208,11 +193,11 @@ echo "Embedding model: Qodo-Embed-1-1.5B (Q8, 1536 dims, MLX)"
 echo ""
 echo "Next steps:"
 echo ""
-echo "1. If model not found, download and quantize it:"
-echo "   ./download-model.sh"
+echo "1. Index your codebase:"
+echo "   ./index.sh /path/to/your/project"
 echo ""
-echo "2. Index your codebase:"
-echo "   ./index.sh"
+echo "2. Start the server:"
+echo "   ./code-rag-server.sh start"
 echo ""
 echo "3. For Claude Code integration:"
 echo "   - Copy mcp-config-template.json contents to your .mcp.json"

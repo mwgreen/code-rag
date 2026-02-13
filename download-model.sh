@@ -4,7 +4,7 @@
 # The full-precision model is ~5.8 GB. After Q8 quantization it's ~1.6 GB
 # with minimal quality loss.
 #
-# Prerequisites: run setup.sh first (creates venv with mlx_lm)
+# Prerequisites: run setup.sh first (creates venv with mlx-embeddings + Qwen2 patch)
 #
 # Usage: ./download-model.sh
 
@@ -19,19 +19,12 @@ if [ ! -f "$PYTHON" ]; then
     exit 1
 fi
 
-# Check mlx_lm is available
-if ! "$PYTHON" -c "import mlx_lm" 2>/dev/null; then
-    echo "Installing mlx-lm for quantization..."
-    "$SCRIPT_DIR/venv/bin/pip" install --quiet mlx-lm
-fi
-
-if [ -f "$MODEL_DIR/model.safetensors" ]; then
+# Check for existing model (also handle sharded output)
+if [ -f "$MODEL_DIR/model.safetensors" ] || [ -f "$MODEL_DIR/model-00001-of-00002.safetensors" ]; then
     echo "Model already exists at $MODEL_DIR"
     echo "Delete it first if you want to re-download."
     exit 0
 fi
-
-mkdir -p "$MODEL_DIR"
 
 echo "======================================================================"
 echo "Downloading Qodo-Embed-1-1.5B and quantizing to Q8"
@@ -45,9 +38,9 @@ echo ""
 echo "This may take several minutes depending on your connection."
 echo ""
 
-# Download and quantize in one step using mlx_lm.convert
+# Download and quantize using mlx_embeddings (understands embedding model architectures)
 "$PYTHON" -c "
-from mlx_lm.convert import convert
+from mlx_embeddings.utils import convert
 
 print('Downloading and quantizing (Q8, group_size=64)...')
 convert(
@@ -60,7 +53,7 @@ convert(
 print('Done!')
 "
 
-if [ -f "$MODEL_DIR/model.safetensors" ]; then
+if [ -f "$MODEL_DIR/model.safetensors" ] || [ -f "$MODEL_DIR/model-00001-of-00002.safetensors" ]; then
     echo ""
     echo "======================================================================"
     echo "Model ready at: $MODEL_DIR"
@@ -68,7 +61,7 @@ if [ -f "$MODEL_DIR/model.safetensors" ]; then
     echo "======================================================================"
 else
     echo ""
-    echo "Error: model.safetensors not found after conversion."
+    echo "Error: model weights not found after conversion."
     echo "Check output above for errors."
     exit 1
 fi
