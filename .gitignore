@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+package-lock.json
+
+# Model files (large, downloaded at setup)
+models/
+
+# Environment
+.env
+
+# Per-project index databases
+.code-rag/
+
+# macOS
+.DS_Store
+
+# Runtime
+*.pid
+*.log

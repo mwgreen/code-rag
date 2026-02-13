@@ -1,0 +1,25 @@
+# Code-RAG dependencies for Apple Silicon Mac
+# Semantic code search with Qodo-Embed-1-1.5B + MLX + Milvus Lite
+
+# Vector database (embedded SQLite-based)
+pymilvus[milvus-lite]>=2.6.0
+
+# MLX embeddings (Apple Silicon GPU)
+mlx>=0.30.0
+mlx-embeddings>=0.0.5
+
+# Transformers (MUST be <5.0 for mlx-embeddings compatibility)
+transformers>=4.40.0,<5.0
+
+# AST-based code chunking (tree-sitter)
+tree-sitter>=0.25.0
+tree-sitter-java>=0.23.0
+tree-sitter-python>=0.25.0
+tree-sitter-typescript>=0.23.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Optional: MCP server for Claude Code integration
+mcp>=1.0.0
