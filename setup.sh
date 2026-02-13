@@ -84,7 +84,7 @@ echo "  This will take 1-2 minutes..."
 pip install --quiet --upgrade pip
 
 echo "  Installing Milvus Lite..."
-pip install --quiet "pymilvus[milvus-lite]"
+pip install --quiet "setuptools>=70.0,<82.0" "pymilvus[milvus-lite]"
 
 echo "  Installing MLX embeddings..."
 pip install --quiet mlx-embeddings mlx mlx-metal

@@ -3,6 +3,7 @@
 
 # Vector database (embedded SQLite-based)
 pymilvus[milvus-lite]>=2.6.0
+setuptools>=70.0,<82.0  # provides pkg_resources needed by milvus-lite (removed in setuptools 82+)
 
 # MLX embeddings (Apple Silicon GPU)
 mlx>=0.30.0
