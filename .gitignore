@@ -29,3 +29,6 @@ data/
 # Runtime
 *.pid
 *.log
+
+# Claude Code local settings
+.claude/
