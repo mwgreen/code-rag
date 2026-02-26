@@ -49,7 +49,7 @@ def get_line_number(source_bytes: bytes, byte_offset: int) -> int:
     return source_bytes[:byte_offset].count(b'\n') + 1
 
 
-def chunk_with_ast(content: str, language: str, path: str, max_size: int = 2000) -> List[Dict]:
+def chunk_with_ast(content: str, language: str, path: str, max_size: int = None) -> List[Dict]:
     """
     Chunk code using AST parsing to respect semantic boundaries.
 
@@ -62,6 +62,10 @@ def chunk_with_ast(content: str, language: str, path: str, max_size: int = 2000)
     Returns:
         List of chunks with AST-aware boundaries
     """
+    if max_size is None:
+        import os
+        max_size = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
+
     parser = get_parser(language)
     if not parser:
         return None  # Fall back to regex chunking

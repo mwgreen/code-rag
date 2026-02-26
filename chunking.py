@@ -32,8 +32,8 @@ except ImportError:
 load_dotenv()
 
 # Configuration
-MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "2000"))
-MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "100"))
+MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
+MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "50"))
 
 
 def detect_language(path: str) -> str:

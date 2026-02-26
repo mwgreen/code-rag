@@ -39,11 +39,15 @@ def _parse_chunks(chunks_data: list) -> List[Dict]:
     return chunks
 
 
-def chunk_with_codechunk(content: str, filepath: str, language: str, max_size: int = 2000) -> Optional[List[Dict]]:
+def chunk_with_codechunk(content: str, filepath: str, language: str, max_size: int = None) -> Optional[List[Dict]]:
     """
     Chunk a single file using code-chunk (spawns Node.js process).
     Use CodeChunkBatch for bulk indexing instead.
     """
+    if max_size is None:
+        import os
+        max_size = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
+
     if language not in SUPPORTED_LANGUAGES:
         return None
 
@@ -82,7 +86,10 @@ class CodeChunkBatch:
             chunks = chunker.chunk(content, filepath, language)
     """
 
-    def __init__(self, max_size: int = 2000):
+    def __init__(self, max_size: int = None):
+        if max_size is None:
+            import os
+            max_size = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
         self.max_size = max_size
         self._proc = None
 

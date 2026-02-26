@@ -9,7 +9,7 @@ import fs from 'fs';
 
 async function main() {
     const filepath = process.argv[2];
-    const maxSize = parseInt(process.argv[3] || '2000');
+    const maxSize = parseInt(process.argv[3] || process.env.MAX_CHUNK_SIZE || '3000');
 
     if (!filepath) {
         console.error('Usage: node chunker.mjs <filepath> [maxSize]');

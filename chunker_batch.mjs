@@ -24,7 +24,8 @@ for await (const line of rl) {
         continue;
     }
 
-    const { filepath, content, max_size = 2000 } = req;
+    const defaultMaxSize = parseInt(process.env.MAX_CHUNK_SIZE || '3000');
+    const { filepath, content, max_size = defaultMaxSize } = req;
 
     try {
         const chunks = await chunk(filepath, content, {
