@@ -13,9 +13,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Optional
 import asyncio
+import logging
 import os
 import hashlib
 import chunking  # Clean chunking utilities (no PyTorch/ChromaDB)
+
+logger = logging.getLogger("code-rag.milvus")
 
 # Embedding model configuration
 # Qodo-Embed-1-1.5B: state-of-the-art code embedding, 1536 dims, Qwen2 architecture
@@ -119,9 +122,12 @@ def init_server_mode():
 def close_server_mode():
     """Close all persistent clients and reset server mode."""
     global _write_lock, _embed_semaphore, _server_mode
-    for path, client in _persistent_clients.items():
-        client.close()
-        print(f"Closed persistent client: {path}")
+    for path, client in list(_persistent_clients.items()):
+        try:
+            client.close()
+            logger.info("Closed persistent client: %s", path)
+        except Exception as e:
+            logger.warning("Error closing client %s: %s", path, e)
     _persistent_clients.clear()
     _write_lock = None
     _embed_semaphore = None
@@ -129,11 +135,27 @@ def close_server_mode():
 
 
 def _get_persistent_client(db_path: str) -> MilvusClient:
-    """Get or create a persistent client for the given DB path."""
-    if db_path not in _persistent_clients:
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    """Get or create a persistent client for the given DB path.
+    On failure, evicts the stale client and retries once."""
+    if db_path in _persistent_clients:
+        try:
+            _persistent_clients[db_path].has_collection(COLLECTION_NAME)
+            return _persistent_clients[db_path]
+        except Exception as e:
+            logger.warning("Stale Milvus client for %s: %s — reconnecting", db_path, e)
+            try:
+                _persistent_clients[db_path].close()
+            except Exception:
+                pass
+            del _persistent_clients[db_path]
+
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
         _persistent_clients[db_path] = MilvusClient(db_path)
-        print(f"Opened persistent client: {db_path}")
+        logger.info("Opened persistent client: %s", db_path)
+    except Exception as e:
+        logger.error("Failed to connect to Milvus at %s: %s", db_path, e)
+        raise
     return _persistent_clients[db_path]
 
 
@@ -232,7 +254,8 @@ def file_needs_indexing(file_path: str, db_path: Optional[str] = None) -> bool:
                 if stored_hash == current_hash:
                     return False
             return True
-    except Exception:
+    except Exception as e:
+        logger.warning("file_needs_indexing check failed for %s: %s", abs_path, e)
         return True
 
 
@@ -313,7 +336,8 @@ def delete_by_path(file_path: str, db_path: Optional[str] = None) -> int:
                     filter=f'path == "{abs_path}"'
                 )
             return len(results)
-    except Exception:
+    except Exception as e:
+        logger.warning("delete_by_path failed for %s: %s", abs_path, e)
         return 0
 
 
@@ -411,8 +435,8 @@ def add_file(path: str, force: bool = False, db_path: Optional[str] = None) -> i
     try:
         with milvus_client(db_path) as client:
             client.delete(collection_name=COLLECTION_NAME, filter=f'path == "{abs_path}"')
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Pre-delete failed for %s (continuing): %s", abs_path, e)
 
     content_hash = compute_file_hash(path)
     chunks = chunking.chunk_file(path)
@@ -449,7 +473,8 @@ def _get_indexed_paths_under(dir_path: str, db_path: Optional[str] = None) -> se
                     paths.add(r['path'])
             iterator.close()
             return paths
-    except Exception:
+    except Exception as e:
+        logger.warning("_get_indexed_paths_under failed for %s: %s", dir_path, e)
         return set()
 
 

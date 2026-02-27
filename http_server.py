@@ -11,9 +11,12 @@ Health: curl http://127.0.0.1:7101/health
 """
 
 import contextlib
+import json
+import logging
 import os
 import signal
 import sys
+import traceback
 from pathlib import Path
 
 import uvicorn
@@ -28,6 +31,8 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import rag_milvus
 import file_watcher
 from tools import register_tools, set_current_project_root
+
+logger = logging.getLogger("code-rag")
 
 # --- Configuration ---
 
@@ -58,10 +63,24 @@ class ProjectMiddleware:
             else:
                 set_current_project_root(None)
 
-        await self.app(scope, receive, send)
+        try:
+            await self.app(scope, receive, send)
+        except Exception as exc:
+            logger.error("ASGI handler error: %s\n%s", exc, traceback.format_exc())
+            if scope["type"] == "http":
+                body = json.dumps({"error": "internal_server_error", "detail": str(exc)}).encode()
+                await send({"type": "http.response.start", "status": 500, "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"content-length", str(len(body)).encode()],
+                ]})
+                await send({"type": "http.response.body", "body": body})
 
 
 # --- Health endpoint ---
+
+_model_loaded = False
+_server_mode_ready = False
+
 
 async def health(request: Request) -> JSONResponse:
     watcher_status = file_watcher.get_watcher_status()
@@ -74,7 +93,12 @@ async def health(request: Request) -> JSONResponse:
             "files_deleted": s["stats"]["files_deleted"],
             "batches": s["stats"]["batches_processed"],
         }
-    return JSONResponse({"status": "ok", "watchers": watchers})
+    return JSONResponse({
+        "status": "ok",
+        "model": _model_loaded,
+        "milvus": _server_mode_ready,
+        "watchers": watchers,
+    })
 
 
 # --- Lifespan ---
@@ -88,16 +112,23 @@ async def lifespan(app: Starlette):
     PID_FILE.write_text(str(os.getpid()))
     print(f"[HTTP] PID {os.getpid()} written to {PID_FILE}", file=sys.stderr)
 
+    global _model_loaded, _server_mode_ready
+
     # Pre-load MLX model
     try:
         print("[HTTP] Pre-loading MLX model...", file=sys.stderr)
         rag_milvus.get_mlx_model()
+        _model_loaded = True
         print("[HTTP] MLX model loaded.", file=sys.stderr)
     except Exception as e:
         print(f"[HTTP] Warning: Could not pre-load model: {e}", file=sys.stderr)
 
     # Init server mode (lazy persistent clients per project)
-    rag_milvus.init_server_mode()
+    try:
+        rag_milvus.init_server_mode()
+        _server_mode_ready = True
+    except Exception as e:
+        print(f"[HTTP] Warning: Could not init server mode: {e}", file=sys.stderr)
 
     # Start session manager
     async with session_manager.run():
