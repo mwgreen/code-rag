@@ -4,6 +4,9 @@ RAG with Milvus Lite + MLX embeddings.
 Each project gets its own DB file at {project_root}/.code-rag/milvus.db.
 The HTTP server shares the MLX model across projects and caches Milvus clients per DB.
 CLI and stdio MCP use ephemeral connections.
+
+Full-text search via SQLite FTS5 sidecar for hybrid search (vector + keyword).
+Results merged with Reciprocal Rank Fusion (RRF).
 """
 
 from pymilvus import MilvusClient, DataType
@@ -16,6 +19,7 @@ import asyncio
 import logging
 import os
 import hashlib
+import sqlite3
 import chunking  # Clean chunking utilities (no PyTorch/ChromaDB)
 
 logger = logging.getLogger("code-rag.milvus")
@@ -102,6 +106,7 @@ _active_client = None
 
 # Persistent client cache: db_path -> MilvusClient (HTTP server)
 _persistent_clients: Dict[str, MilvusClient] = {}
+_persistent_fts: Dict[str, sqlite3.Connection] = {}
 
 # Async concurrency primitives (initialized once for HTTP server)
 _write_lock: Optional[asyncio.Lock] = None
@@ -120,18 +125,202 @@ def init_server_mode():
 
 
 def close_server_mode():
-    """Close all persistent clients and reset server mode."""
+    """Close all persistent clients (Milvus + FTS) and reset server mode."""
     global _write_lock, _embed_semaphore, _server_mode
     for path, client in list(_persistent_clients.items()):
         try:
             client.close()
-            logger.info("Closed persistent client: %s", path)
+            logger.info("Closed Milvus client: %s", path)
         except Exception as e:
-            logger.warning("Error closing client %s: %s", path, e)
+            logger.warning("Error closing Milvus client %s: %s", path, e)
     _persistent_clients.clear()
+    for path, conn in list(_persistent_fts.items()):
+        try:
+            conn.close()
+            logger.info("Closed FTS connection: %s", path)
+        except Exception as e:
+            logger.warning("Error closing FTS connection %s: %s", path, e)
+    _persistent_fts.clear()
     _write_lock = None
     _embed_semaphore = None
     _server_mode = False
+
+
+# --- FTS5 SQLite sidecar ---
+
+def _fts_db_path(milvus_db_path: str) -> str:
+    """Derive the FTS database path from the Milvus DB path.
+
+    milvus.db -> fts.db in the same directory.
+    """
+    return str(Path(milvus_db_path).parent / "fts.db")
+
+
+def _get_fts_connection(milvus_db_path: str) -> sqlite3.Connection:
+    """Get or create a persistent FTS SQLite connection."""
+    fts_path = _fts_db_path(milvus_db_path)
+
+    if fts_path in _persistent_fts:
+        try:
+            _persistent_fts[fts_path].execute("SELECT 1")
+            return _persistent_fts[fts_path]
+        except Exception:
+            logger.warning("Stale FTS connection for %s — reconnecting", fts_path)
+            try:
+                _persistent_fts[fts_path].close()
+            except Exception:
+                pass
+            del _persistent_fts[fts_path]
+
+    Path(fts_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(fts_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_fts_table(conn)
+
+    if _server_mode:
+        _persistent_fts[fts_path] = conn
+        logger.info("Opened FTS connection: %s", fts_path)
+
+    return conn
+
+
+def _ensure_fts_table(conn: sqlite3.Connection):
+    """Create the FTS5 virtual table if it doesn't exist."""
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            doc_id,
+            content,
+            path UNINDEXED,
+            language UNINDEXED,
+            type UNINDEXED
+        )
+    """)
+    conn.commit()
+
+
+def _fts_insert_chunks(conn: sqlite3.Connection, documents: List[str],
+                       metadatas: List[Dict], ids: List[str]):
+    """Insert chunks into the FTS5 table. Skips duplicates by doc_id."""
+    for doc, meta, doc_id in zip(documents, metadatas, ids):
+        existing = conn.execute(
+            "SELECT doc_id FROM chunks_fts WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            "INSERT INTO chunks_fts (doc_id, content, path, language, type) VALUES (?, ?, ?, ?, ?)",
+            (
+                doc_id,
+                doc[:65535],
+                meta.get("path", ""),
+                meta.get("language", ""),
+                meta.get("type", ""),
+            ),
+        )
+    conn.commit()
+
+
+def _fts_delete_by_path(conn: sqlite3.Connection, file_path: str):
+    """Delete all FTS chunks for a given file path."""
+    conn.execute("DELETE FROM chunks_fts WHERE path = ?", (file_path,))
+    conn.commit()
+
+
+def fts_search(query: str, n: int = 15, type_filter: Optional[str] = None,
+               language_filter: Optional[str] = None,
+               db_path: Optional[str] = None) -> List[Dict]:
+    """Full-text search using FTS5 BM25 ranking."""
+    if not db_path:
+        return []
+
+    try:
+        conn = _get_fts_connection(db_path)
+    except Exception as e:
+        logger.warning("FTS connection failed: %s", e)
+        return []
+
+    safe_query = query.replace('"', '""')
+
+    where_parts = []
+    params: list = []
+    if type_filter:
+        where_parts.append("type = ?")
+        params.append(type_filter)
+    if language_filter:
+        where_parts.append("language = ?")
+        params.append(language_filter)
+
+    where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
+
+    sql = f"""
+        SELECT doc_id, content, path, language, type,
+               bm25(chunks_fts, 0, 1, 0, 0, 0) as rank
+        FROM chunks_fts
+        WHERE chunks_fts MATCH ?{where_clause}
+        ORDER BY rank
+        LIMIT ?
+    """
+    params_full = [safe_query] + params + [n]
+
+    try:
+        rows = conn.execute(sql, params_full).fetchall()
+    except Exception as e:
+        logger.debug("FTS5 MATCH failed (%s), trying quoted phrase", e)
+        params_full[0] = f'"{safe_query}"'
+        try:
+            rows = conn.execute(sql, params_full).fetchall()
+        except Exception as e2:
+            logger.warning("FTS5 search failed: %s", e2)
+            return []
+
+    results = []
+    for row in rows:
+        results.append({
+            "content": row[1],
+            "doc_id": row[0],
+            "path": row[2],
+            "language": row[3],
+            "type": row[4],
+            "distance": 0.0,
+        })
+
+    if not _server_mode:
+        conn.close()
+
+    return results
+
+
+def rrf_merge(vector_results: List[Dict], fts_results: List[Dict],
+              n: int, k: int = 60) -> List[Dict]:
+    """Reciprocal Rank Fusion: merge two ranked lists.
+
+    score(doc) = sum(1 / (k + rank)) across both lists.
+    k=60 is the standard constant from the original RRF paper.
+    """
+    scores: Dict[str, float] = {}
+    docs: Dict[str, Dict] = {}
+
+    for rank, r in enumerate(vector_results):
+        key = r.get("doc_id") or r.get("path", str(rank))
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in docs:
+            docs[key] = r
+
+    for rank, r in enumerate(fts_results):
+        key = r.get("doc_id") or r.get("path", str(rank))
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in docs:
+            docs[key] = r
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    merged = []
+    for key, score in ranked[:n]:
+        result = docs[key].copy()
+        result["_rrf_score"] = score
+        merged.append(result)
+
+    return merged
 
 
 def _get_persistent_client(db_path: str) -> MilvusClient:
@@ -282,12 +471,25 @@ def add_documents(documents: List[str], metadatas: List[Dict], ids: List[str],
     with milvus_client(db_path) as client:
         client.insert(collection_name=COLLECTION_NAME, data=data)
 
+    # Dual-write into FTS5 sidecar
+    try:
+        if db_path:
+            fts_conn = _get_fts_connection(db_path)
+            _fts_insert_chunks(fts_conn, documents, metadatas, ids)
+            if not _server_mode:
+                fts_conn.close()
+    except Exception as e:
+        logger.warning("FTS insert failed (non-fatal): %s", e)
+
     return len(documents)
 
 
 def search(query: str, n: int = 5, type_filter: Optional[str] = None,
            language_filter: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict]:
-    """Search for similar documents."""
+    """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF."""
+    fetch_n = n * 3
+
+    # --- Vector search ---
     query_embedding = embed_texts([query])[0]
 
     filters = []
@@ -301,23 +503,44 @@ def search(query: str, n: int = 5, type_filter: Optional[str] = None,
         results = client.search(
             collection_name=COLLECTION_NAME,
             data=[query_embedding],
-            limit=n,
+            limit=fetch_n,
             filter=filter_expr,
             output_fields=["document", "path", "language", "type", "doc_id"]
         )
 
-    formatted = []
+    vector_results = []
     if results and len(results) > 0:
         for hit in results[0]:
-            formatted.append({
+            vector_results.append({
                 'content': hit['entity']['document'],
+                'doc_id': hit['entity'].get('doc_id', ''),
                 'path': hit['entity'].get('path', ''),
                 'language': hit['entity'].get('language', ''),
                 'type': hit['entity'].get('type', ''),
                 'distance': hit['distance']
             })
 
-    return formatted
+    # --- FTS5 keyword search ---
+    fts_results = fts_search(query, n=fetch_n, type_filter=type_filter,
+                             language_filter=language_filter, db_path=db_path)
+
+    # --- Merge with RRF ---
+    if fts_results and vector_results:
+        merged = rrf_merge(vector_results, fts_results, n=fetch_n)
+    elif fts_results:
+        merged = fts_results
+    else:
+        merged = vector_results
+
+    if not merged:
+        return []
+
+    # Clean up internal fields
+    for r in merged:
+        r.pop("_rrf_score", None)
+        r.pop("doc_id", None)
+
+    return merged[:n]
 
 
 def delete_by_path(file_path: str, db_path: Optional[str] = None) -> int:
@@ -335,18 +558,43 @@ def delete_by_path(file_path: str, db_path: Optional[str] = None) -> int:
                     collection_name=COLLECTION_NAME,
                     filter=f'path == "{abs_path}"'
                 )
-            return len(results)
     except Exception as e:
         logger.warning("delete_by_path failed for %s: %s", abs_path, e)
         return 0
 
+    # Also delete from FTS
+    try:
+        if db_path:
+            conn = _get_fts_connection(db_path)
+            _fts_delete_by_path(conn, abs_path)
+            if not _server_mode:
+                conn.close()
+    except Exception as e:
+        logger.warning("FTS delete_by_path failed (non-fatal): %s", e)
+
+    return len(results)
+
 
 def clear_collection(db_path: Optional[str] = None):
-    """Clear all data."""
+    """Clear all data (Milvus + FTS)."""
     with milvus_client(db_path) as client:
         if client.has_collection(COLLECTION_NAME):
             client.drop_collection(COLLECTION_NAME)
             print(f"Collection cleared")
+
+    # Clear FTS database
+    if db_path:
+        fts_path = _fts_db_path(db_path)
+        if fts_path in _persistent_fts:
+            try:
+                _persistent_fts[fts_path].close()
+            except Exception:
+                pass
+            del _persistent_fts[fts_path]
+        fts_file = Path(fts_path)
+        if fts_file.exists():
+            fts_file.unlink()
+            print(f"FTS database deleted: {fts_path}")
 
 
 def _query_all(output_fields: list, batch_size: int = 1000, db_path: Optional[str] = None) -> list:
@@ -619,45 +867,16 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
 
 async def search_async(query: str, n: int = 5, type_filter: Optional[str] = None,
                        language_filter: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict]:
-    """Async search. Serializes embedding via semaphore, reads are lock-free."""
+    """Async hybrid search. Serializes embedding via semaphore."""
     loop = asyncio.get_event_loop()
 
     if _embed_semaphore is not None:
         async with _embed_semaphore:
-            query_embedding = await loop.run_in_executor(None, lambda: embed_texts([query])[0])
+            return await loop.run_in_executor(
+                None, lambda: search(query, n, type_filter, language_filter, db_path))
     else:
-        query_embedding = await loop.run_in_executor(None, lambda: embed_texts([query])[0])
-
-    filters = []
-    if type_filter:
-        filters.append(f'type == "{type_filter}"')
-    if language_filter:
-        filters.append(f'language == "{language_filter}"')
-    filter_expr = " && ".join(filters) if filters else None
-
-    def _do_search():
-        with milvus_client(db_path) as client:
-            return client.search(
-                collection_name=COLLECTION_NAME,
-                data=[query_embedding],
-                limit=n,
-                filter=filter_expr,
-                output_fields=["document", "path", "language", "type", "doc_id"]
-            )
-
-    results = await loop.run_in_executor(None, _do_search)
-
-    formatted = []
-    if results and len(results) > 0:
-        for hit in results[0]:
-            formatted.append({
-                'content': hit['entity']['document'],
-                'path': hit['entity'].get('path', ''),
-                'language': hit['entity'].get('language', ''),
-                'type': hit['entity'].get('type', ''),
-                'distance': hit['distance']
-            })
-    return formatted
+        return await loop.run_in_executor(
+            None, lambda: search(query, n, type_filter, language_filter, db_path))
 
 
 async def add_file_async(path: str, force: bool = False, db_path: Optional[str] = None) -> int:
