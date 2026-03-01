@@ -89,6 +89,9 @@ pip install --quiet "setuptools>=70.0,<82.0" "pymilvus[milvus-lite]"
 echo "  Installing MLX embeddings..."
 pip install --quiet mlx-embeddings mlx mlx-metal
 
+echo "  Installing MLX LM (NL descriptions)..."
+pip install --quiet mlx-lm
+
 echo "  Installing transformers <5.0 (required for compatibility)..."
 pip install --quiet "transformers<5.0"
 
@@ -123,6 +126,21 @@ mkdir -p data
 # Download and quantize embedding model
 echo ""
 "$SCRIPT_DIR/download-model.sh"
+
+# Pre-download NL descriptions model (Qwen3-4B, used with CODE_RAG_DESCRIPTIONS=1)
+echo ""
+echo "Pre-downloading NL descriptions model (Qwen3-4B-MLX-4bit)..."
+"$PYTHON" << 'QWENEOF'
+try:
+    from mlx_lm import load
+    print("  Downloading Qwen3-4B-MLX-4bit (~2.5 GB)...")
+    model, tokenizer = load("Qwen/Qwen3-4B-MLX-4bit", tokenizer_config={"trust_remote_code": False})
+    print("  Description model cached for offline use")
+    del model, tokenizer
+except Exception as e:
+    print(f"  NL descriptions model download skipped: {e}")
+    print("  (optional — enable later with CODE_RAG_DESCRIPTIONS=1)")
+QWENEOF
 
 # Test installation
 echo ""

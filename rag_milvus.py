@@ -9,6 +9,13 @@ Full-text search via SQLite FTS5 sidecar for hybrid search (vector + keyword).
 Results merged with Reciprocal Rank Fusion (RRF).
 """
 
+import os
+
+# Block all HuggingFace network access at runtime.
+# Models must be pre-downloaded via setup.sh / download-model.sh.
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+
 from pymilvus import MilvusClient, DataType
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
@@ -17,9 +24,9 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import asyncio
 import logging
-import os
 import hashlib
 import chunking  # Clean chunking utilities (no PyTorch/ChromaDB)
+import nl_descriptions
 from fts_hybrid import FTSIndex, rrf_merge
 
 logger = logging.getLogger("code-rag.milvus")
@@ -29,15 +36,9 @@ logger = logging.getLogger("code-rag.milvus")
 # Prefers local Q8 quantized model (~1.6 GB) over full-precision HF model (~5.8 GB)
 _SCRIPT_DIR = Path(__file__).parent
 _LOCAL_Q8_MODEL = _SCRIPT_DIR / "models" / "qodo-embed-1-1.5b-mlx-q8"
-_DEFAULT_MODEL = str(_LOCAL_Q8_MODEL) if _LOCAL_Q8_MODEL.exists() else "Qodo/Qodo-Embed-1-1.5B"
+_DEFAULT_MODEL = str(_LOCAL_Q8_MODEL)
 _MODEL_PATH = os.getenv("EMBED_MODEL_PATH", _DEFAULT_MODEL)
 _EMBED_DIM = 1536
-
-# Auto-enable offline mode if using HF model ID and it's cached
-if not Path(_MODEL_PATH).exists():
-    _model_cache = Path.home() / ".cache/huggingface/hub/models--Qodo--Qodo-Embed-1-1.5B"
-    if _model_cache.exists() and 'HF_HUB_OFFLINE' not in os.environ:
-        os.environ['HF_HUB_OFFLINE'] = '1'
 
 
 def compute_file_hash(file_path: str) -> str:
@@ -81,11 +82,15 @@ def get_mlx_model():
     if _mlx_model is not None:
         return _mlx_model, _mlx_tokenizer
 
-    _is_local = Path(_MODEL_PATH).exists()
-    _label = "local Q8" if _is_local else "HuggingFace"
-    print(f"Loading Qodo-Embed-1-1.5B ({_label}) from {_MODEL_PATH}...")
+    if not Path(_MODEL_PATH).exists():
+        raise RuntimeError(
+            f"Embedding model not found at {_MODEL_PATH}. "
+            f"Run ./setup.sh or ./download-model.sh to download it."
+        )
+
+    print(f"Loading Qodo-Embed-1-1.5B from {_MODEL_PATH}...")
     _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_PATH)
-    print(f"Qodo-Embed-1-1.5B ready ({_EMBED_DIM} dims, {_label})")
+    print(f"Qodo-Embed-1-1.5B ready ({_EMBED_DIM} dims)")
 
     return _mlx_model, _mlx_tokenizer
 
@@ -106,7 +111,11 @@ _active_client = None
 
 # Persistent client cache: db_path -> MilvusClient (HTTP server)
 _persistent_clients: Dict[str, MilvusClient] = {}
-_fts = FTSIndex("chunks_fts", ["path", "language", "type"])
+_fts = FTSIndex(
+    "chunks_fts",
+    ["path", "language", "type", "start_line", "end_line", "class_name", "component", "description"],
+    indexed_metadata={"description"},
+)
 
 # Async concurrency primitives (initialized once for HTTP server)
 _write_lock: Optional[asyncio.Lock] = None
@@ -267,9 +276,16 @@ def file_needs_indexing(file_path: str, db_path: Optional[str] = None) -> bool:
 
 
 def add_documents(documents: List[str], metadatas: List[Dict], ids: List[str],
-                  content_hash: Optional[str] = None, db_path: Optional[str] = None) -> int:
-    """Add documents to Milvus with MLX embeddings."""
-    embeddings = embed_texts(documents)
+                  content_hash: Optional[str] = None, db_path: Optional[str] = None,
+                  documents_for_embed: Optional[List[str]] = None) -> int:
+    """Add documents to Milvus with MLX embeddings.
+
+    Args:
+        documents_for_embed: If provided, these texts are embedded instead of documents,
+            but the original documents are stored in the 'document' field. Used for
+            augmented embedding (description + code) while storing only the code.
+    """
+    embeddings = embed_texts(documents_for_embed if documents_for_embed else documents)
 
     data = []
     for i, (doc, meta, doc_id, emb) in enumerate(zip(documents, metadatas, ids, embeddings)):
@@ -299,6 +315,11 @@ def add_documents(documents: List[str], metadatas: List[Dict], ids: List[str],
                 "path": meta.get("path", ""),
                 "language": meta.get("language", ""),
                 "type": meta.get("type", ""),
+                "start_line": str(meta.get("start_line", "")),
+                "end_line": str(meta.get("end_line", "")),
+                "class_name": meta.get("class_name", ""),
+                "component": meta.get("component", ""),
+                "description": meta.get("description", ""),
             } for doc, meta, doc_id in zip(documents, metadatas, ids)]
             _fts.insert(fts_conn, fts_records)
             _fts.close_ephemeral(fts_conn)
@@ -306,6 +327,11 @@ def add_documents(documents: List[str], metadatas: List[Dict], ids: List[str],
         logger.warning("FTS insert failed (non-fatal): %s", e)
 
     return len(documents)
+
+
+def _content_fingerprint(content: str) -> str:
+    """Fingerprint for dedup: normalize whitespace, first 500 chars."""
+    return ' '.join(content.split())[:500]
 
 
 def search(query: str, n: int = 5, type_filter: Optional[str] = None,
@@ -329,20 +355,29 @@ def search(query: str, n: int = 5, type_filter: Optional[str] = None,
             data=[query_embedding],
             limit=fetch_n,
             filter=filter_expr,
-            output_fields=["document", "path", "language", "type", "doc_id"]
+            output_fields=["document", "path", "language", "type", "doc_id",
+                           "description", "start_line", "end_line", "class_name", "component"]
         )
 
     vector_results = []
     if results and len(results) > 0:
         for hit in results[0]:
-            vector_results.append({
-                'content': hit['entity']['document'],
-                'doc_id': hit['entity'].get('doc_id', ''),
-                'path': hit['entity'].get('path', ''),
-                'language': hit['entity'].get('language', ''),
-                'type': hit['entity'].get('type', ''),
-                'distance': hit['distance']
-            })
+            entity = hit['entity']
+            result = {
+                'content': entity['document'],
+                'doc_id': entity.get('doc_id', ''),
+                'path': entity.get('path', ''),
+                'language': entity.get('language', ''),
+                'type': entity.get('type', ''),
+                'distance': hit['distance'],
+                'start_line': entity.get('start_line', 0),
+                'end_line': entity.get('end_line', 0),
+            }
+            for field in ('description', 'class_name', 'component'):
+                val = entity.get(field)
+                if val:
+                    result[field] = val
+            vector_results.append(result)
 
     # --- FTS5 keyword search ---
     fts_filters = {}
@@ -363,12 +398,25 @@ def search(query: str, n: int = 5, type_filter: Optional[str] = None,
     if not merged:
         return []
 
-    # Clean up internal fields
+    # Deduplicate near-identical results (same code from different index entries)
+    seen_fingerprints = set()
+    deduped = []
     for r in merged:
+        fp = _content_fingerprint(r.get('content', ''))
+        if fp not in seen_fingerprints:
+            seen_fingerprints.add(fp)
+            deduped.append(r)
+    merged = deduped
+
+    # Take top n results
+    final = merged[:n]
+
+    # Clean up internal fields
+    for r in final:
         r.pop("_rrf_score", None)
         r.pop("doc_id", None)
 
-    return merged[:n]
+    return final
 
 
 def delete_by_path(file_path: str, db_path: Optional[str] = None) -> int:
@@ -508,11 +556,36 @@ def add_file(path: str, force: bool = False, db_path: Optional[str] = None) -> i
     if not chunks:
         return 0
 
+    # Generate NL descriptions if enabled (env var or descriptions.db exists)
+    desc_enabled = nl_descriptions.is_enabled(db_path=db_path)
+    descriptions = nl_descriptions.describe_chunks(chunks, db_path=db_path) if desc_enabled else [None] * len(chunks)
+
     docs = [c['content'] for c in chunks]
-    metas = [{'path': abs_path, 'language': c['language'], 'type': c['type']} for c in chunks]
+
+    # Build augmented docs for embedding (description prepended to code)
+    docs_for_embed = []
+    for c, desc in zip(chunks, descriptions):
+        if desc:
+            docs_for_embed.append(f"{desc}\n\n{c['content']}")
+        else:
+            docs_for_embed.append(c['content'])
+
+    metas = [{
+        'path': abs_path,
+        'language': c['language'],
+        'type': c['type'],
+        'start_line': c.get('start_line', 0),
+        'end_line': c.get('end_line', 0),
+        'class_name': c.get('class_name', ''),
+        'component': c.get('component', ''),
+        **({"description": desc} if desc else {}),
+    } for c, desc in zip(chunks, descriptions)]
+
     ids = [f"{abs_path}::{i}" for i in range(len(chunks))]
 
-    add_documents(docs, metas, ids, content_hash=content_hash, db_path=db_path)
+    add_documents(docs, metas, ids, content_hash=content_hash, db_path=db_path,
+                  documents_for_embed=docs_for_embed if desc_enabled else None)
+
     return len(chunks)
 
 
@@ -669,6 +742,10 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
             if progress_callback:
                 progress_callback(idx + 1, total_files, file_path.name)
 
+    # Free description model memory after batch indexing
+    if nl_descriptions.is_enabled(db_path=db_path):
+        nl_descriptions.unload_model()
+
     return {
         'files_indexed': files_indexed,
         'files_skipped': files_skipped,
@@ -676,7 +753,7 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
         'chunks_created': chunks_created,
         'errors': errors,
         'by_language': by_language,
-        'by_type': by_type
+        'by_type': by_type,
     }
 
 

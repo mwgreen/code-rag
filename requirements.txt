@@ -9,6 +9,9 @@ setuptools>=70.0,<82.0  # provides pkg_resources needed by milvus-lite (removed 
 mlx>=0.30.0
 mlx-embeddings>=0.0.5
 
+# MLX LM (local NL description generation for code chunks)
+mlx-lm>=0.20.0
+
 # Transformers (MUST be <5.0 for mlx-embeddings compatibility)
 transformers>=4.40.0,<5.0
 

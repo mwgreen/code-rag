@@ -57,8 +57,19 @@ def format_results(results: list[dict]) -> str:
         return "No results found."
 
     output = []
+
+    # Low-confidence warning when best vector result has poor similarity
+    vector_distances = [r['distance'] for r in results
+                        if r.get('distance') is not None and r['distance'] > 0.01]
+    if vector_distances and min(vector_distances) > 0.5:
+        output.append(
+            "*Note: Low semantic similarity — results may not match your query well. "
+            "Consider using Grep for exact keyword matching.*\n"
+        )
+
     for r in results:
-        output.append(f"### {r['path']}:{r.get('start_line', '?')}-{r.get('end_line', '?')}")
+        header = f"### {r['path']}:{r.get('start_line', '?')}-{r.get('end_line', '?')}"
+        output.append(header)
 
         meta_parts = [f"**Language:** {r['language']}", f"**Type:** {r['type']}"]
         if r.get('class_name'):
@@ -69,6 +80,8 @@ def format_results(results: list[dict]) -> str:
             meta_parts.append(f"**Relevance:** {1 - r['distance']:.2f}")
 
         output.append(" | ".join(meta_parts))
+        if r.get('description'):
+            output.append(f"**Summary:** {r['description']}")
         output.append(f"```{r['language']}\n{r['content']}\n```")
         output.append("")
 
@@ -280,7 +293,7 @@ def register_tools(server: Server):
 
         try:
             if name == "search_code":
-                results = rag_milvus.search(
+                results = await rag_milvus.search_async(
                     arguments["query"], arguments.get("n", 5),
                     type_filter="code", language_filter=arguments.get("language"),
                     db_path=db
@@ -288,14 +301,14 @@ def register_tools(server: Server):
                 return [types.TextContent(type="text", text=format_results(results))]
 
             elif name == "search_docs":
-                results = rag_milvus.search(
+                results = await rag_milvus.search_async(
                     arguments["query"], arguments.get("n", 5),
                     type_filter="documentation", db_path=db
                 )
                 return [types.TextContent(type="text", text=format_results(results))]
 
             elif name == "search_all":
-                results = rag_milvus.search(
+                results = await rag_milvus.search_async(
                     arguments["query"], arguments.get("n", 10),
                     db_path=db
                 )

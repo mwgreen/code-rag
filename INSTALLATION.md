@@ -177,7 +177,8 @@ code-rag/                           # Tool directory (lives in your dev env repo
 └── server.log                      # Server log
 
 {project}/.code-rag/                # Per-project index
-└── milvus.db                       # Milvus Lite vector DB
+├── milvus.db                       # Milvus Lite vector DB
+└── fts.db                          # FTS5 keyword index
 ```
 
 ## Troubleshooting
