@@ -1,9 +1,10 @@
 """
 LLM-generated natural language descriptions for code chunks.
 
-Uses Qwen3-4B-MLX-4bit to generate one-sentence summaries of code chunks,
-improving semantic search by bridging the vocabulary gap between natural
-language queries and code that implements the concept without using the same terms.
+Uses a local MLX LLM (default: Qwen3-4B-MLX-4bit, configurable via
+CODE_RAG_DESCRIPTION_MODEL env var) to generate one-sentence summaries of
+code chunks, improving semantic search by bridging the vocabulary gap between
+natural language queries and code.
 
 Descriptions are cached in SQLite keyed by SHA256 of chunk content.
 Enabled via CODE_RAG_DESCRIPTIONS=1 environment variable (off by default).
@@ -25,7 +26,7 @@ logger = logging.getLogger("code-rag.descriptions")
 
 # --- Configuration ---
 
-MODEL_ID = "Qwen/Qwen3-4B-MLX-4bit"
+MODEL_ID = os.getenv("CODE_RAG_DESCRIPTION_MODEL", "mlx-community/gemma-3-4b-it-4bit")
 MAX_GEN_TOKENS = 100
 MAX_INPUT_CHARS = 2000
 MIN_CHUNK_CHARS = 100  # Skip tiny chunks (imports-only, trivial)
@@ -102,12 +103,20 @@ def generate_description(code: str) -> str:
     prompt = PROMPT_TEMPLATE.format(code=code[:MAX_INPUT_CHARS])
 
     if hasattr(tokenizer, "apply_chat_template"):
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=False,
-        )
+        try:
+            formatted = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=False,
+            )
+        except TypeError:
+            # Models like Gemma 3 don't support enable_thinking
+            formatted = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
     else:
         formatted = prompt
 

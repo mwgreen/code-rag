@@ -96,6 +96,8 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "model": _model_loaded,
+        "embed_model": Path(rag_milvus._MODEL_PATH).name if _model_loaded else None,
+        "embed_dim": rag_milvus._EMBED_DIM,
         "milvus": _server_mode_ready,
         "watchers": watchers,
     })

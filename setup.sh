@@ -109,15 +109,25 @@ pip install --quiet mcp || echo "  MCP install failed (optional, can skip)"
 
 echo "  All dependencies installed"
 
-# Install Qwen2 patch for mlx-embeddings (required for Qodo-Embed model)
+# Install architecture patches for mlx-embeddings
 echo ""
-echo "Installing Qwen2 architecture patch for mlx-embeddings..."
+echo "Installing architecture patches for mlx-embeddings..."
 MLX_MODELS_DIR=$(python3 -c "import mlx_embeddings.models; import os; print(os.path.dirname(mlx_embeddings.models.__file__))")
-if [ -f "patches/mlx_embeddings_qwen2.py" ] && [ -n "$MLX_MODELS_DIR" ]; then
-    cp patches/mlx_embeddings_qwen2.py "$MLX_MODELS_DIR/qwen2.py"
-    echo "  Qwen2 architecture installed into mlx-embeddings"
+if [ -n "$MLX_MODELS_DIR" ]; then
+    if [ -f "patches/mlx_embeddings_qwen2.py" ]; then
+        cp patches/mlx_embeddings_qwen2.py "$MLX_MODELS_DIR/qwen2.py"
+        echo "  Qwen2 architecture installed (for Qodo-Embed-1-1.5B)"
+    else
+        echo "  Warning: patches/mlx_embeddings_qwen2.py not found"
+    fi
+    if [ -f "patches/mlx_embeddings_codexembed2b.py" ]; then
+        cp patches/mlx_embeddings_codexembed2b.py "$MLX_MODELS_DIR/codexembed2b.py"
+        echo "  CodexEmbed2B architecture installed (for SFR-Embedding-Code-2B)"
+    else
+        echo "  Warning: patches/mlx_embeddings_codexembed2b.py not found"
+    fi
 else
-    echo "  Warning: Could not install Qwen2 patch. Check patches/mlx_embeddings_qwen2.py exists."
+    echo "  Warning: Could not find mlx-embeddings models directory"
 fi
 
 # Create data directory
@@ -127,20 +137,32 @@ mkdir -p data
 echo ""
 "$SCRIPT_DIR/download-model.sh"
 
-# Pre-download NL descriptions model (Qwen3-4B, used with CODE_RAG_DESCRIPTIONS=1)
+# Pre-download NL description models (used with CODE_RAG_DESCRIPTIONS=1)
 echo ""
-echo "Pre-downloading NL descriptions model (Qwen3-4B-MLX-4bit)..."
-"$PYTHON" << 'QWENEOF'
+echo "Pre-downloading NL description models..."
+"$PYTHON" << 'DESCEOF'
+from mlx_lm import load
+
+# Default: Qwen3-4B
 try:
-    from mlx_lm import load
     print("  Downloading Qwen3-4B-MLX-4bit (~2.5 GB)...")
     model, tokenizer = load("Qwen/Qwen3-4B-MLX-4bit", tokenizer_config={"trust_remote_code": False})
-    print("  Description model cached for offline use")
+    print("  Qwen3-4B cached for offline use")
     del model, tokenizer
 except Exception as e:
-    print(f"  NL descriptions model download skipped: {e}")
-    print("  (optional — enable later with CODE_RAG_DESCRIPTIONS=1)")
-QWENEOF
+    print(f"  Qwen3-4B download skipped: {e}")
+
+# Alternative: Gemma 3 4B
+try:
+    print("  Downloading gemma-3-4b-it-4bit (~2.5 GB)...")
+    model, tokenizer = load("mlx-community/gemma-3-4b-it-4bit", tokenizer_config={"trust_remote_code": False})
+    print("  Gemma-3-4B cached for offline use")
+    del model, tokenizer
+except Exception as e:
+    print(f"  Gemma-3-4B download skipped: {e}")
+
+print("  (enable descriptions with CODE_RAG_DESCRIPTIONS=1)")
+DESCEOF
 
 # Test installation
 echo ""
@@ -210,7 +232,7 @@ echo "======================================================================"
 echo "Installation Complete!"
 echo "======================================================================"
 echo ""
-echo "Embedding model: Qodo-Embed-1-1.5B (Q8, 1536 dims, MLX)"
+echo "Default embedding model: Qodo-Embed-1-1.5B (Q8, 1536 dims, MLX)"
 echo ""
 echo "Next steps:"
 echo ""
@@ -224,5 +246,16 @@ echo "3. For Claude Code integration:"
 echo "   - Copy mcp-config-template.json contents to your .mcp.json"
 echo "   - Or merge into existing .mcp.json"
 echo "   - Restart Claude Code"
+echo ""
+echo "Optional: Alternative models"
+echo ""
+echo "  Embedding (SFR-Embedding-Code-2B, Gemma 2, 2304 dims):"
+echo "    ./download-sfr-embed.sh"
+echo "    export EMBED_MODEL_PATH=./models/sfr-embed-code-2b-mlx-q8"
+echo ""
+echo "  NL descriptions (Gemma 3 4B instead of Qwen3 4B):"
+echo "    export CODE_RAG_DESCRIPTION_MODEL=mlx-community/gemma-3-4b-it-4bit"
+echo ""
+echo "  Note: Switching embedding models requires re-indexing."
 echo ""
 echo "======================================================================"

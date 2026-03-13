@@ -9,6 +9,7 @@ Full-text search via SQLite FTS5 sidecar for hybrid search (vector + keyword).
 Results merged with Reciprocal Rank Fusion (RRF).
 """
 
+import json
 import os
 
 # Block all HuggingFace network access at runtime.
@@ -32,13 +33,35 @@ from fts_hybrid import FTSIndex, rrf_merge
 logger = logging.getLogger("code-rag.milvus")
 
 # Embedding model configuration
-# Qodo-Embed-1-1.5B: state-of-the-art code embedding, 1536 dims, Qwen2 architecture
-# Prefers local Q8 quantized model (~1.6 GB) over full-precision HF model (~5.8 GB)
+# Default: SFR-Embedding-Code-2B_R (Gemma 2, 2304 dims). Also supports:
+#   Qodo-Embed-1-1.5B (Qwen2, 1536 dims) via EMBED_MODEL_PATH env var.
+# Prefers local Q8 quantized model over full-precision HF model.
 _SCRIPT_DIR = Path(__file__).parent
-_LOCAL_Q8_MODEL = _SCRIPT_DIR / "models" / "qodo-embed-1-1.5b-mlx-q8"
+_LOCAL_Q8_MODEL = _SCRIPT_DIR / "models" / "sfr-embed-code-2b-mlx-q8"
 _DEFAULT_MODEL = str(_LOCAL_Q8_MODEL)
 _MODEL_PATH = os.getenv("EMBED_MODEL_PATH", _DEFAULT_MODEL)
-_EMBED_DIM = 1536
+_EMBED_DIM = None  # Auto-detected from model config.json
+
+
+def _detect_embed_dim(model_path: str) -> int:
+    """Read hidden_size from the model's config.json to determine embedding dimension."""
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        raise RuntimeError(f"Model config not found at {config_path}")
+    with open(config_path) as f:
+        config = json.load(f)
+    dim = config.get("hidden_size")
+    if not dim:
+        raise RuntimeError(f"hidden_size not found in {config_path}")
+    return dim
+
+
+def _get_embed_dim() -> int:
+    """Get embedding dimension, detecting from model config if needed."""
+    global _EMBED_DIM
+    if _EMBED_DIM is None:
+        _EMBED_DIM = _detect_embed_dim(_MODEL_PATH)
+    return _EMBED_DIM
 
 
 def compute_file_hash(file_path: str) -> str:
@@ -77,7 +100,7 @@ _mlx_tokenizer = None
 
 def get_mlx_model():
     """Get or load MLX model (one-time load)."""
-    global _mlx_model, _mlx_tokenizer
+    global _mlx_model, _mlx_tokenizer, _EMBED_DIM
 
     if _mlx_model is not None:
         return _mlx_model, _mlx_tokenizer
@@ -88,20 +111,52 @@ def get_mlx_model():
             f"Run ./setup.sh or ./download-model.sh to download it."
         )
 
-    print(f"Loading Qodo-Embed-1-1.5B from {_MODEL_PATH}...")
+    _EMBED_DIM = _detect_embed_dim(_MODEL_PATH)
+    model_name = Path(_MODEL_PATH).name
+    print(f"Loading {model_name} from {_MODEL_PATH}...")
     _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_PATH)
-    print(f"Qodo-Embed-1-1.5B ready ({_EMBED_DIM} dims)")
+    print(f"{model_name} ready ({_EMBED_DIM} dims)")
 
     return _mlx_model, _mlx_tokenizer
 
 
+# Query instruction prefix for models that require asymmetric encoding.
+# SFR-Embedding-Code requires this on queries; documents are encoded raw.
+# Qodo-Embed does not use instructions, so this is empty by default.
+_QUERY_INSTRUCTION = None  # Auto-detected from model config
+
+
+def _get_query_instruction() -> str:
+    """Get the query instruction prefix, detecting from model config if needed."""
+    global _QUERY_INSTRUCTION
+    if _QUERY_INSTRUCTION is not None:
+        return _QUERY_INSTRUCTION
+    config_path = Path(_MODEL_PATH) / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        # SFR/CodeXEmbed models use model_type "codexembed2b"
+        if config.get("model_type", "").startswith("codexembed"):
+            _QUERY_INSTRUCTION = "Instruct: Given Code or Text, retrieval relevant content\nQuery: "
+            return _QUERY_INSTRUCTION
+    _QUERY_INSTRUCTION = ""
+    return _QUERY_INSTRUCTION
+
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Embed texts using MLX."""
+    """Embed texts (documents/passages) using MLX. No query instruction added."""
     model, tokenizer = get_mlx_model()
     output = mlx_generate(model, tokenizer, texts=texts)
     embeddings = output.text_embeds.tolist()
     mx.clear_cache()
     return embeddings
+
+
+def embed_query(query: str) -> List[float]:
+    """Embed a search query, prepending instruction prefix if the model requires it."""
+    instruction = _get_query_instruction()
+    text = f"{instruction}{query}" if instruction else query
+    return embed_texts([text])[0]
 
 
 # --- Client management ---
@@ -175,6 +230,49 @@ def _get_persistent_client(db_path: str) -> MilvusClient:
     return _persistent_clients[db_path]
 
 
+def _write_model_config(meta_path: Path):
+    """Write current model configuration metadata alongside the Milvus DB."""
+    meta = {
+        "embed_model_path": _MODEL_PATH,
+        "embed_dim": _get_embed_dim(),
+    }
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+
+def _check_model_consistency(db_path: str):
+    """Check that current embedding model matches what was used to build the index.
+
+    On first use, writes model_config.json. On subsequent loads, compares
+    the stored embedding dimension against the current model and raises
+    a clear error on mismatch.
+    """
+    meta_path = Path(db_path).parent / "model_config.json"
+    current_dim = _get_embed_dim()
+
+    if not meta_path.exists():
+        _write_model_config(meta_path)
+        return
+
+    with open(meta_path) as f:
+        stored = json.load(f)
+
+    stored_dim = stored.get("embed_dim")
+    if stored_dim and stored_dim != current_dim:
+        stored_model = stored.get("embed_model_path", "unknown")
+        raise RuntimeError(
+            f"Embedding dimension mismatch: index was built with {stored_dim}-dim "
+            f"embeddings (model: {stored_model}), but current model produces "
+            f"{current_dim}-dim embeddings (model: {_MODEL_PATH}). "
+            f"Re-index with: ./index.sh --force /path/to/project"
+        )
+
+    # Update model path if it changed but dim is the same
+    if stored.get("embed_model_path") != _MODEL_PATH:
+        _write_model_config(meta_path)
+
+
 def _resolve_db_path(db_path: Optional[str]) -> str:
     """Resolve a db_path. Raises if not provided — every caller must supply one."""
     if not db_path:
@@ -185,10 +283,11 @@ def _resolve_db_path(db_path: Optional[str]) -> str:
 def _ensure_collection(client):
     """Create collection if it doesn't exist."""
     if not client.has_collection(COLLECTION_NAME):
-        print(f"Creating Milvus collection: {COLLECTION_NAME} (dim={_EMBED_DIM})")
+        dim = _get_embed_dim()
+        print(f"Creating Milvus collection: {COLLECTION_NAME} (dim={dim})")
         client.create_collection(
             collection_name=COLLECTION_NAME,
-            dimension=_EMBED_DIM,
+            dimension=dim,
             metric_type="COSINE",
         )
         print(f"Collection created: {COLLECTION_NAME}")
@@ -206,6 +305,7 @@ def milvus_session(db_path: Optional[str] = None):
         # HTTP server — reuse persistent client
         client = _get_persistent_client(path)
         _ensure_collection(client)
+        _check_model_consistency(path)
         old_active = _active_client
         _active_client = client
         try:
@@ -217,6 +317,7 @@ def milvus_session(db_path: Optional[str] = None):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         client = MilvusClient(path)
         _ensure_collection(client)
+        _check_model_consistency(path)
         _active_client = client
         try:
             yield client
@@ -235,6 +336,7 @@ def milvus_client(db_path: Optional[str] = None):
     if _server_mode:
         client = _get_persistent_client(path)
         _ensure_collection(client)
+        _check_model_consistency(path)
         yield client  # Don't close — server lifetime
     elif _active_client is not None:
         yield _active_client  # Reuse session — don't close
@@ -242,6 +344,7 @@ def milvus_client(db_path: Optional[str] = None):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         client = MilvusClient(path)
         _ensure_collection(client)
+        _check_model_consistency(path)
         try:
             yield client
         finally:
@@ -340,7 +443,7 @@ def search(query: str, n: int = 5, type_filter: Optional[str] = None,
     fetch_n = n * 3
 
     # --- Vector search ---
-    query_embedding = embed_texts([query])[0]
+    query_embedding = embed_query(query)
 
     filters = []
     if type_filter:
