@@ -51,16 +51,9 @@ _tokenizer = None
 def is_enabled(db_path: str | None = None) -> bool:
     """Check if NL descriptions are enabled.
 
-    Enabled if CODE_RAG_DESCRIPTIONS=1 env var is set, OR if a descriptions.db
-    cache already exists for the project (meaning descriptions were previously
-    generated and can be reused without a full reindex).
+    Enabled by default. Disable with CODE_RAG_DESCRIPTIONS=0.
     """
-    if os.getenv("CODE_RAG_DESCRIPTIONS", "0") == "1":
-        return True
-    if db_path:
-        cache_path = _get_cache_db_path(db_path)
-        return Path(cache_path).exists()
-    return False
+    return os.getenv("CODE_RAG_DESCRIPTIONS", "1") != "0"
 
 
 def load_model():
