@@ -2,7 +2,7 @@
 # Semantic code search with Qodo-Embed-1-1.5B + MLX + Milvus Lite
 
 # Vector database (embedded SQLite-based)
-pymilvus[milvus-lite]>=2.6.0
+pymilvus[milvus-lite]>=2.6.0,!=2.6.10  # 2.6.10 breaks unix socket address for milvus-lite
 setuptools>=70.0,<82.0  # provides pkg_resources needed by milvus-lite (removed in setuptools 82+)
 
 # MLX embeddings (Apple Silicon GPU)
