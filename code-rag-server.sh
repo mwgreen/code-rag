@@ -52,6 +52,7 @@ start_watchdog() {
     stop_watchdog
 
     (
+        set +e  # Don't let unexpected failures kill the watchdog
         failures=0
         while true; do
             sleep "$WATCHDOG_INTERVAL"
@@ -68,7 +69,6 @@ start_watchdog() {
 
                 # Kill old server if still alive
                 if [ -f "$PID_FILE" ]; then
-                    local old_pid
                     old_pid=$(cat "$PID_FILE")
                     kill "$old_pid" 2>/dev/null || true
                     sleep 2
@@ -77,7 +77,6 @@ start_watchdog() {
                 fi
 
                 # Kill stale port holders
-                local stale_pids
                 stale_pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
                 if [ -n "$stale_pids" ]; then
                     echo "$stale_pids" | xargs kill 2>/dev/null || true
@@ -89,7 +88,7 @@ start_watchdog() {
                 nohup "$PYTHON" -u "$SCRIPT_DIR/http_server.py" >> "$LOG_FILE" 2>&1 &
 
                 # Wait for it to be healthy
-                local waited=0
+                waited=0
                 while [ $waited -lt $MAX_WAIT ]; do
                     sleep 1
                     waited=$((waited + 1))
