@@ -1,7 +1,7 @@
 """
 LLM-generated natural language descriptions for code chunks.
 
-Uses a local MLX LLM (default: Qwen3-4B-MLX-4bit, configurable via
+Uses a local MLX LLM (default: gemma-3-4b-it-4bit, configurable via
 CODE_RAG_DESCRIPTION_MODEL env var) to generate one-sentence summaries of
 code chunks, improving semantic search by bridging the vocabulary gap between
 natural language queries and code.
@@ -57,7 +57,7 @@ def is_enabled(db_path: str | None = None) -> bool:
 
 
 def load_model():
-    """Load Qwen3-4B-MLX-4bit for description generation."""
+    """Load the description model (default: gemma-3-4b-it-4bit)."""
     global _model, _tokenizer
     if _model is not None:
         return _model, _tokenizer
