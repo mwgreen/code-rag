@@ -5,6 +5,8 @@ Both stdio (mcp_server.py) and HTTP (http_server.py) import from here.
 
 import asyncio
 import contextvars
+import fnmatch
+import os
 from pathlib import Path
 from mcp.server import Server
 from mcp import types
@@ -47,6 +49,31 @@ def get_db_path() -> str:
     """Derive the Milvus DB path from the current project root."""
     root = get_current_project_root()
     return str(Path(root) / ".code-rag" / "milvus.db")
+
+
+# --- Relevance filtering ---
+
+def _apply_relevance_floor(results: list[dict], min_relevance: float) -> tuple[list[dict], bool]:
+    """Filter results below min_relevance. Returns (filtered_results, all_below_floor)."""
+    if min_relevance <= 0 or not results:
+        return results, False
+    filtered = [r for r in results
+                if r.get('distance') is None or (1 - r['distance']) >= min_relevance]
+    if not filtered:
+        return results, True  # Return all with warning
+    return filtered, False
+
+
+def _format_search_results(results: list[dict], min_relevance: float, grouped: bool = False) -> str:
+    """Apply relevance floor, format results, and append read_file hint."""
+    results, below_floor = _apply_relevance_floor(results, min_relevance)
+    text = format_results_grouped(results) if grouped else format_results(results)
+    if below_floor:
+        text = ("*Warning: All results are below the configured relevance threshold "
+                f"({min_relevance:.2f}). Showing best matches anyway.*\n\n" + text)
+    if results:
+        text += "\n*To read the full file, use the read_file tool with the path shown above.*"
+    return text
 
 
 # --- Formatting helpers ---
@@ -275,6 +302,47 @@ def register_tools(server: Server):
                     "required": []
                 }
             ),
+            types.Tool(
+                name="read_file",
+                description="Read the full content of a file in the project. Use after searching to see complete file context.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the file to read"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based start line (optional, for reading a range)"
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "1-based end line, inclusive (optional)"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            ),
+            types.Tool(
+                name="delete_by_pattern",
+                description="Delete indexed entries matching a glob pattern. Use dry_run=true (default) to preview.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern matched against indexed file paths (e.g. '**/*.yaml', '.playwright-mcp/*')"
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "If true (default), show what would be deleted without deleting",
+                            "default": True
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            ),
         ]
 
     @server.call_tool()
@@ -291,6 +359,16 @@ def register_tools(server: Server):
         except Exception:
             pass
 
+        # Lazy stale entry cleanup (once per project per server lifetime)
+        try:
+            rag_milvus.cleanup_stale_entries(db)
+        except Exception:
+            pass
+
+        # Load project config
+        ragconfig = rag_milvus.load_ragconfig(project_root)
+        min_relevance = ragconfig.get('min_relevance', 0.0)
+
         try:
             if name == "search_code":
                 results = await rag_milvus.search_async(
@@ -298,21 +376,24 @@ def register_tools(server: Server):
                     type_filter="code", language_filter=arguments.get("language"),
                     db_path=db
                 )
-                return [types.TextContent(type="text", text=format_results(results))]
+                return [types.TextContent(type="text",
+                    text=_format_search_results(results, min_relevance))]
 
             elif name == "search_docs":
                 results = await rag_milvus.search_async(
                     arguments["query"], arguments.get("n", 5),
                     type_filter="documentation", db_path=db
                 )
-                return [types.TextContent(type="text", text=format_results(results))]
+                return [types.TextContent(type="text",
+                    text=_format_search_results(results, min_relevance))]
 
             elif name == "search_all":
                 results = await rag_milvus.search_async(
                     arguments["query"], arguments.get("n", 10),
                     db_path=db
                 )
-                return [types.TextContent(type="text", text=format_results_grouped(results))]
+                return [types.TextContent(type="text",
+                    text=_format_search_results(results, min_relevance, grouped=True))]
 
             elif name == "index_file":
                 count = rag_milvus.add_file(arguments["path"], force=True, db_path=db)
@@ -355,6 +436,102 @@ def register_tools(server: Server):
                     f"- Errors: {s['errors']}",
                 ]
                 return [types.TextContent(type="text", text="\n".join(lines))]
+
+            elif name == "read_file":
+                file_path = arguments["path"]
+                abs_path = str(Path(file_path).resolve())
+
+                # Security: must be under project root
+                real_root = os.path.realpath(project_root)
+                if not abs_path.startswith(real_root + os.sep) and abs_path != real_root:
+                    return [types.TextContent(type="text",
+                        text=f"Error: Path must be within the project root ({project_root})")]
+
+                if not os.path.isfile(abs_path):
+                    return [types.TextContent(type="text",
+                        text=f"Error: File not found: {abs_path}")]
+
+                max_bytes = ragconfig.get('read_file_max_bytes', 102400)
+                start_line = arguments.get("start_line")
+                end_line = arguments.get("end_line")
+
+                try:
+                    with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                        all_lines = f.readlines()
+                except Exception as e:
+                    return [types.TextContent(type="text", text=f"Error reading file: {e}")]
+
+                total_lines = len(all_lines)
+                file_size = os.path.getsize(abs_path)
+
+                if start_line or end_line:
+                    s = max(1, start_line or 1)
+                    e = min(total_lines, end_line or total_lines)
+                    selected = all_lines[s-1:e]
+                    line_range = f"{s}-{e}"
+                    first_line_num = s
+                else:
+                    selected = all_lines
+                    line_range = f"1-{total_lines}"
+                    first_line_num = 1
+
+                content = ''.join(selected)
+                truncated = False
+                if len(content.encode('utf-8')) > max_bytes:
+                    content = content[:max_bytes]
+                    last_nl = content.rfind('\n')
+                    if last_nl > 0:
+                        content = content[:last_nl]
+                    truncated = True
+
+                # Add line numbers
+                numbered = []
+                for i, line in enumerate(content.splitlines(), start=first_line_num):
+                    numbered.append(f"{i:4d} | {line}")
+                display = '\n'.join(numbered)
+
+                meta = f"**{abs_path}** | Lines {line_range} | {total_lines} total lines | {file_size} bytes"
+                if truncated:
+                    shown = len(numbered)
+                    meta += (f"\n*File truncated at {shown} lines ({max_bytes} bytes). "
+                             "Use start_line/end_line to read specific sections.*")
+
+                return [types.TextContent(type="text", text=f"{meta}\n```\n{display}\n```")]
+
+            elif name == "delete_by_pattern":
+                pattern = arguments["pattern"]
+                dry_run = arguments.get("dry_run", True)
+
+                indexed = rag_milvus.list_indexed_files(db_path=db)
+                all_paths = []
+                for paths in indexed.values():
+                    all_paths.extend(paths)
+
+                matches = []
+                for path in all_paths:
+                    rel_path = os.path.relpath(path, project_root)
+                    if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(path, pattern):
+                        matches.append(path)
+
+                if not matches:
+                    return [types.TextContent(type="text",
+                        text=f"No indexed files match pattern: {pattern}")]
+
+                if dry_run:
+                    output = f"**Dry run** — {len(matches)} files would be deleted:\n\n"
+                    for p in sorted(matches):
+                        output += f"- {p}\n"
+                    output += f"\nRe-run with dry_run=false to delete."
+                    return [types.TextContent(type="text", text=output)]
+
+                deleted = 0
+                for path in matches:
+                    count = rag_milvus.delete_by_path(path, db_path=db)
+                    if count > 0:
+                        deleted += 1
+
+                return [types.TextContent(type="text",
+                    text=f"Deleted {deleted} files matching pattern: {pattern}")]
 
             else:
                 raise ValueError(f"Unknown tool: {name}")

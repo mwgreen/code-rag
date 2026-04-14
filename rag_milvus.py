@@ -26,6 +26,8 @@ from typing import List, Dict, Optional
 import asyncio
 import logging
 import hashlib
+import fnmatch
+import yaml
 import chunking  # Clean chunking utilities (no PyTorch/ChromaDB)
 import nl_descriptions
 from fts_hybrid import FTSIndex, rrf_merge
@@ -559,6 +561,31 @@ def delete_by_path(file_path: str, db_path: Optional[str] = None) -> int:
     return len(results)
 
 
+# Track which projects have had stale cleanup (once per server lifetime)
+_stale_cleanup_done: set = set()
+
+
+def cleanup_stale_entries(db_path: str):
+    """Remove index entries for files that no longer exist on disk.
+    Runs once per project per server lifetime."""
+    project_root = str(Path(db_path).parent.parent)
+    if project_root in _stale_cleanup_done:
+        return
+    _stale_cleanup_done.add(project_root)
+
+    all_results = _query_all(["path"], db_path=db_path)
+    unique_paths = set(r['path'] for r in all_results)
+
+    removed = 0
+    for path in unique_paths:
+        if not os.path.exists(path):
+            delete_by_path(path, db_path)
+            removed += 1
+
+    if removed:
+        logger.info("Cleaned %d stale entries for %s", removed, Path(project_root).name)
+
+
 def clear_collection(db_path: Optional[str] = None):
     """Clear all data (Milvus + FTS)."""
     with milvus_client(db_path) as client:
@@ -665,6 +692,18 @@ def add_file(path: str, force: bool = False, db_path: Optional[str] = None) -> i
     if not chunks:
         return 0
 
+    # Apply type_overrides from .ragconfig
+    if db_path:
+        _project_root = str(Path(db_path).parent.parent)
+        type_overrides = load_ragconfig(_project_root).get('type_overrides', [])
+        if type_overrides:
+            rel_path = os.path.relpath(abs_path, _project_root)
+            for override in type_overrides:
+                if fnmatch.fnmatch(rel_path, override.get('pattern', '')):
+                    for chunk in chunks:
+                        chunk['type'] = override['type']
+                    break
+
     # Generate NL descriptions if enabled (env var or descriptions.db exists)
     desc_enabled = nl_descriptions.is_enabled(db_path=db_path)
     descriptions = nl_descriptions.describe_chunks(chunks, db_path=db_path) if desc_enabled else [None] * len(chunks)
@@ -766,6 +805,54 @@ def get_excluded_dirs(extra_excludes: Optional[List[str]] = None, project_root: 
     return excluded
 
 
+# --- Per-project .ragconfig ---
+
+_ragconfig_cache: Dict[str, dict] = {}
+
+_RAGCONFIG_DEFAULTS = {
+    'min_relevance': 0.0,
+    'exclude_extensions': [],
+    'exclude_patterns': [],
+    'type_overrides': [],
+    'read_file_max_bytes': 102400,
+}
+
+
+def load_ragconfig(project_root: Optional[str] = None) -> dict:
+    """Load .ragconfig from the project directory. Returns defaults for missing fields."""
+    if not project_root:
+        return dict(_RAGCONFIG_DEFAULTS)
+
+    if project_root in _ragconfig_cache:
+        return _ragconfig_cache[project_root]
+
+    config_path = Path(project_root) / '.ragconfig'
+    if not config_path.exists():
+        _ragconfig_cache[project_root] = dict(_RAGCONFIG_DEFAULTS)
+        return _ragconfig_cache[project_root]
+
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning("Failed to load .ragconfig: %s", e)
+        _ragconfig_cache[project_root] = dict(_RAGCONFIG_DEFAULTS)
+        return _ragconfig_cache[project_root]
+
+    result = dict(_RAGCONFIG_DEFAULTS)
+    for key in _RAGCONFIG_DEFAULTS:
+        if key in config:
+            result[key] = config[key]
+    _ragconfig_cache[project_root] = result
+    logger.info("Loaded .ragconfig for %s", Path(project_root).name)
+    return result
+
+
+def invalidate_ragconfig(project_root: str):
+    """Invalidate cached ragconfig for hot reload."""
+    _ragconfig_cache.pop(project_root, None)
+
+
 def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
                     incremental: bool = True, progress_callback=None,
                     max_files: int = 0, extra_excludes: Optional[List[str]] = None,
@@ -778,6 +865,9 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
     # Derive project root from db_path ({root}/.code-rag/milvus.db) for .ragignore lookup
     project_root = str(Path(db_path).parent.parent) if db_path else None
     excluded_dirs = get_excluded_dirs(extra_excludes, project_root=project_root)
+    ragconfig = load_ragconfig(project_root)
+    ragconfig_exclude_ext = set(ragconfig.get('exclude_extensions', []))
+    ragconfig_exclude_patterns = ragconfig.get('exclude_patterns', [])
 
     files_indexed = 0
     files_skipped = 0
@@ -797,6 +887,12 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
             continue
         if excluded_dirs & set(file_path.parts):
             continue
+        if file_path.suffix in ragconfig_exclude_ext:
+            continue
+        if ragconfig_exclude_patterns:
+            rel = str(file_path.relative_to(dir_path))
+            if any(fnmatch.fnmatch(rel, pat) for pat in ragconfig_exclude_patterns):
+                continue
         if file_path.suffix in ('.js', '.jsx'):
             if file_path.with_suffix('.ts').exists() or file_path.with_suffix('.tsx').exists():
                 continue

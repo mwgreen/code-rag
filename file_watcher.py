@@ -9,6 +9,7 @@ Pipeline: FSEvents -> watchdog thread -> filter -> asyncio.Queue -> debounce -> 
 """
 
 import asyncio
+import fnmatch
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,9 @@ class FileChangeHandler(FileSystemEventHandler):
     def _should_handle(self, path: str) -> bool:
         """Fast pre-filter. Runs in watchdog thread — must be cheap."""
         p = Path(path)
+        # Config files trigger reload (handled specially in _process_batch)
+        if p.name in ('.ragignore', '.ragconfig'):
+            return True
         # Extension check
         if p.suffix not in _WATCH_EXTENSIONS:
             return False
@@ -71,6 +75,18 @@ class FileChangeHandler(FileSystemEventHandler):
         # Excluded directories
         if self._excluded_dirs & set(p.parts):
             return False
+        # .ragconfig exclusions
+        ragconfig = rag_milvus.load_ragconfig(self.project_root)
+        if p.suffix in ragconfig.get('exclude_extensions', []):
+            return False
+        exclude_patterns = ragconfig.get('exclude_patterns', [])
+        if exclude_patterns:
+            try:
+                rel_path = os.path.relpath(path, self.project_root)
+                if any(fnmatch.fnmatch(rel_path, pat) for pat in exclude_patterns):
+                    return False
+            except ValueError:
+                pass
         # Skip large files (>1MB)
         try:
             if p.exists() and p.stat().st_size > 1024 * 1024:
@@ -126,6 +142,7 @@ class ProjectWatcher:
         self.git_settle_seconds = git_settle_seconds
 
         self._observer: Optional[Observer] = None
+        self._handler: Optional[FileChangeHandler] = None
         self._change_queue: asyncio.Queue = asyncio.Queue()
         self._drain_task: Optional[asyncio.Task] = None
         self._pending_changes: Dict[str, str] = {}  # path -> action
@@ -143,6 +160,7 @@ class ProjectWatcher:
         """Start watching the project directory."""
         loop = asyncio.get_event_loop()
         handler = FileChangeHandler(self.project_root, self._change_queue, loop)
+        self._handler = handler
 
         self._observer = Observer()
         self._observer.schedule(handler, self.project_root, recursive=True)
@@ -242,6 +260,47 @@ class ProjectWatcher:
             return False
         return (git_dir / 'index.lock').exists()
 
+    async def _cleanup_excluded_files(self):
+        """Remove indexed files that are now excluded by .ragignore/.ragconfig."""
+        loop = asyncio.get_event_loop()
+        short = Path(self.project_root).name
+
+        excluded_dirs = rag_milvus.get_excluded_dirs(project_root=self.project_root)
+        ragconfig = rag_milvus.load_ragconfig(self.project_root)
+        exclude_ext = set(ragconfig.get('exclude_extensions', []))
+        exclude_patterns = ragconfig.get('exclude_patterns', [])
+
+        indexed = await loop.run_in_executor(None,
+            lambda: rag_milvus.list_indexed_files(db_path=self.db_path))
+
+        all_paths = []
+        for paths in indexed.values():
+            all_paths.extend(paths)
+
+        removed = 0
+        for path in all_paths:
+            p = Path(path)
+            should_exclude = False
+
+            if excluded_dirs & set(p.parts):
+                should_exclude = True
+            elif p.suffix in exclude_ext:
+                should_exclude = True
+            elif exclude_patterns:
+                try:
+                    rel_path = os.path.relpath(path, self.project_root)
+                    if any(fnmatch.fnmatch(rel_path, pat) for pat in exclude_patterns):
+                        should_exclude = True
+                except ValueError:
+                    pass
+
+            if should_exclude:
+                await rag_milvus.delete_by_path_async(path, self.db_path)
+                removed += 1
+
+        if removed:
+            _log(f"{short}/: Config reload — removed {removed} now-excluded files")
+
     async def _process_batch(self):
         """Process accumulated changes."""
         if not self._pending_changes:
@@ -253,6 +312,22 @@ class ProjectWatcher:
         # Snapshot and clear — new events accumulate in a fresh dict
         batch = dict(self._pending_changes)
         self._pending_changes.clear()
+
+        # Check for config file changes
+        config_files = {p for p in batch if Path(p).name in ('.ragignore', '.ragconfig')}
+        if config_files:
+            # Remove config files from normal processing
+            for cf in config_files:
+                batch.pop(cf, None)
+            # Invalidate caches and reload
+            rag_milvus.invalidate_ragconfig(self.project_root)
+            if self._handler:
+                self._handler._excluded_dirs = None
+            _log(f"{short}/: Config file changed — reloading exclusions")
+            try:
+                await self._cleanup_excluded_files()
+            except Exception as e:
+                _log(f"{short}/: Config reload cleanup error: {e}")
 
         # Cap batch size, re-queue overflow
         if len(batch) > self.max_batch_size:
