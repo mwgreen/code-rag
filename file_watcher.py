@@ -32,7 +32,11 @@ _watcher_config = {
 # File extensions to watch (matches index_directory defaults)
 _WATCH_EXTENSIONS = {
     '.java', '.js', '.ts', '.tsx', '.jsx', '.json',
-    '.xml', '.yaml', '.yml', '.md', '.gradle', '.properties'
+    '.xml', '.yaml', '.yml', '.md', '.gradle', '.properties',
+    # API schemas — these are the canonical contract for GraphQL/proto/etc.
+    # behavior. Without them indexed, agents can't answer "what does the API
+    # accept" questions and confabulate from prose docs instead.
+    '.graphql', '.graphqls', '.proto',
 }
 
 

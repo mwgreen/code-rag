@@ -52,7 +52,10 @@ def detect_language(path: str) -> str:
         '.yml': 'yaml',
         '.md': 'markdown',
         '.properties': 'properties',
-        '.gradle': 'gradle'
+        '.gradle': 'gradle',
+        '.graphql': 'graphql',
+        '.graphqls': 'graphql',
+        '.proto': 'protobuf',
     }
 
     return lang_map.get(ext, 'unknown')

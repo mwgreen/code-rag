@@ -880,7 +880,7 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
     """Index all files in a directory."""
     dir_path = Path(dir_path)
     extensions = extensions or ['.java', '.js', '.ts', '.tsx', '.jsx', '.json', '.xml', '.yaml', '.yml', '.md',
-                                '.gradle', '.properties']
+                                '.gradle', '.properties', '.graphql', '.graphqls', '.proto']
 
     # Derive project root from db_path ({root}/.code-rag/milvus.db) for .ragignore lookup
     project_root = str(Path(db_path).parent.parent) if db_path else None
