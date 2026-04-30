@@ -74,6 +74,27 @@ def _format_search_results(results: list[dict], min_relevance: float, grouped: b
                 f"({min_relevance:.2f}). Showing best matches anyway.*\n\n" + text)
     if results:
         text += "\n*To read the full file, use the read_file tool with the path shown above.*"
+        # Multi-chunk hint: when a single file shows up in 2+ result chunks, the
+        # caller probably wants the whole doc, not just disconnected slices.
+        # Cascade / list / "walk me through" questions are the canonical case
+        # where partial reads produce confidently-incomplete answers.
+        path_counts: dict[str, int] = {}
+        for r in results:
+            p = r.get('path')
+            if p:
+                path_counts[p] = path_counts.get(p, 0) + 1
+        multi_hit = sorted(
+            [(p, n) for p, n in path_counts.items() if n >= 2],
+            key=lambda x: -x[1],
+        )
+        if multi_hit:
+            top = "\n".join(f"  - {p} ({n} chunks)" for p, n in multi_hit[:3])
+            text += (
+                "\n\n*Multiple chunks of the same file matched. For cascade / "
+                '"walk me through" / list questions, read the whole file before '
+                "answering — partial chunks lead to confidently incomplete "
+                f"answers:*\n{top}"
+            )
     return text
 
 

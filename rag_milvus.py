@@ -20,6 +20,7 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 from pymilvus import MilvusClient, DataType
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
+from mlx_gpu import GPU
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -101,7 +102,11 @@ _mlx_tokenizer = None
 
 
 def get_mlx_model():
-    """Get or load MLX model (one-time load)."""
+    """Get or load MLX model (one-time load).
+
+    Holds the GPU lock during load so a concurrent description-model load on
+    another thread doesn't collide on the Metal command buffer.
+    """
     global _mlx_model, _mlx_tokenizer, _EMBED_DIM
 
     if _mlx_model is not None:
@@ -113,11 +118,16 @@ def get_mlx_model():
             f"Run ./setup.sh or ./download-model.sh to download it."
         )
 
-    _EMBED_DIM = _detect_embed_dim(_MODEL_PATH)
-    model_name = Path(_MODEL_PATH).name
-    print(f"Loading {model_name} from {_MODEL_PATH}...")
-    _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_PATH)
-    print(f"{model_name} ready ({_EMBED_DIM} dims)")
+    with GPU:
+        # Double-check inside the lock — another thread may have loaded it
+        # while we were waiting.
+        if _mlx_model is not None:
+            return _mlx_model, _mlx_tokenizer
+        _EMBED_DIM = _detect_embed_dim(_MODEL_PATH)
+        model_name = Path(_MODEL_PATH).name
+        print(f"Loading {model_name} from {_MODEL_PATH}...")
+        _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_PATH)
+        print(f"{model_name} ready ({_EMBED_DIM} dims)")
 
     return _mlx_model, _mlx_tokenizer
 
@@ -146,11 +156,17 @@ def _get_query_instruction() -> str:
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Embed texts (documents/passages) using MLX. No query instruction added."""
+    """Embed texts (documents/passages) using MLX. No query instruction added.
+
+    Holds the GPU lock for the duration of generation + cache clear so the
+    description model running on another thread doesn't collide on the Metal
+    command buffer.
+    """
     model, tokenizer = get_mlx_model()
-    output = mlx_generate(model, tokenizer, texts=texts)
-    embeddings = output.text_embeds.tolist()
-    mx.clear_cache()
+    with GPU:
+        output = mlx_generate(model, tokenizer, texts=texts)
+        embeddings = output.text_embeds.tolist()
+        mx.clear_cache()
     return embeddings
 
 
@@ -940,7 +956,8 @@ def index_directory(dir_path: str, extensions: Optional[List[str]] = None,
                     by_type[t] = by_type.get(t, 0) + num_chunks
 
                     if files_indexed % 10 == 0:
-                        mx.clear_cache()
+                        with GPU:
+                            mx.clear_cache()
                 else:
                     files_skipped += 1
 

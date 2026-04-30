@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from mlx_gpu import GPU
+
 # Block HuggingFace network access (also set by rag_milvus on import)
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
 os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
@@ -79,20 +81,26 @@ def load_model():
 
     from mlx_lm import load
 
-    print(f"Loading {MODEL_ID} for NL descriptions...")
-    t0 = time.perf_counter()
-    try:
-        _model, _tokenizer = load(MODEL_ID, tokenizer_config={"trust_remote_code": False})
-    except Exception as e:
-        _model_load_failed = True
-        logger.warning(
-            "Failed to load description model %s: %s. Disabling NL descriptions for this process. "
-            "Set CODE_RAG_DESCRIPTIONS=0 to silence this, or pre-download the model.",
-            MODEL_ID, e
-        )
-        raise
-    elapsed = time.perf_counter() - t0
-    print(f"Description model ready ({elapsed:.1f}s)")
+    with GPU:
+        # Re-check inside the lock — a parallel caller may have loaded it
+        if _model is not None:
+            return _model, _tokenizer
+        if _model_load_failed:
+            raise RuntimeError("description model unavailable (load previously failed)")
+        print(f"Loading {MODEL_ID} for NL descriptions...")
+        t0 = time.perf_counter()
+        try:
+            _model, _tokenizer = load(MODEL_ID, tokenizer_config={"trust_remote_code": False})
+        except Exception as e:
+            _model_load_failed = True
+            logger.warning(
+                "Failed to load description model %s: %s. Disabling NL descriptions for this process. "
+                "Set CODE_RAG_DESCRIPTIONS=0 to silence this, or pre-download the model.",
+                MODEL_ID, e
+            )
+            raise
+        elapsed = time.perf_counter() - t0
+        print(f"Description model ready ({elapsed:.1f}s)")
     return _model, _tokenizer
 
 
@@ -106,7 +114,8 @@ def unload_model():
         import gc
         import mlx.core as mx
         gc.collect()
-        mx.clear_cache()
+        with GPU:
+            mx.clear_cache()
         print("Description model unloaded")
 
 
@@ -137,9 +146,10 @@ def generate_description(code: str) -> str:
     else:
         formatted = prompt
 
-    response = generate(
-        model, tokenizer, prompt=formatted, max_tokens=MAX_GEN_TOKENS, verbose=False
-    )
+    with GPU:
+        response = generate(
+            model, tokenizer, prompt=formatted, max_tokens=MAX_GEN_TOKENS, verbose=False
+        )
     return response.strip()
 
 

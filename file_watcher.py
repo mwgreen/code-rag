@@ -471,7 +471,9 @@ class ProjectWatcher:
             if indexed > 0 and indexed % 20 == 0:
                 try:
                     import mlx.core as mx
-                    mx.clear_cache()
+                    from mlx_gpu import GPU
+                    with GPU:
+                        mx.clear_cache()
                 except Exception:
                     pass
 
