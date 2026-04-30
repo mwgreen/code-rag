@@ -445,90 +445,11 @@ def chunk_typescript(content: str, path: str) -> List[Dict]:
     return chunks
 
 
-def chunk_yaml(content: str, path: str) -> List[Dict]:
-    """Chunk YAML documentation files intelligently."""
-    # For YAML docs, try to parse structure
-    # If it's a single document, keep it as one chunk (unless too large)
-    # If it has sections, split by section
-
-    if len(content) <= MAX_CHUNK_SIZE:
-        # Keep small YAML files as single chunks
-        return [{
-            'content': content,
-            'start_line': 1,
-            'end_line': len(content.split('\n'))
-        }]
-
-    # For large YAML files, split by top-level keys or document separators
-    chunks = []
-    lines = content.split('\n')
-    current_chunk = []
-    chunk_start = 0
-
-    for i, line in enumerate(lines):
-        # YAML document separator
-        if line.strip() == '---' and current_chunk:
-            chunks.append({
-                'content': '\n'.join(current_chunk),
-                'start_line': chunk_start + 1,
-                'end_line': i
-            })
-            current_chunk = []
-            chunk_start = i
-
-        current_chunk.append(line)
-
-        # Split if too large
-        if len('\n'.join(current_chunk)) >= MAX_CHUNK_SIZE:
-            chunks.append({
-                'content': '\n'.join(current_chunk),
-                'start_line': chunk_start + 1,
-                'end_line': i + 1
-            })
-            current_chunk = []
-            chunk_start = i + 1
-
-    # Add final chunk
-    if current_chunk:
-        chunks.append({
-            'content': '\n'.join(current_chunk),
-            'start_line': chunk_start + 1,
-            'end_line': len(lines)
-        })
-
-    return chunks if chunks else chunk_default(content, path)
-
-
-def chunk_default(content: str, path: str) -> List[Dict]:
-    """Default chunker for config files and unknown types."""
-    lines = content.split('\n')
-
-    # For small files, return as single chunk
-    if len(content) <= MAX_CHUNK_SIZE:
-        return [{
-            'content': content,
-            'start_line': 1,
-            'end_line': len(lines)
-        }]
-
-    # For large files, split into fixed-size chunks with overlap
-    chunks = []
-    chunk_size = MAX_CHUNK_SIZE // 10  # Rough lines per chunk
-    overlap = 10  # Lines of overlap
-
-    start = 0
-    while start < len(lines):
-        end = min(start + chunk_size, len(lines))
-        chunk_lines = lines[start:end]
-
-        chunks.append({
-            'content': '\n'.join(chunk_lines),
-            'start_line': start + 1,
-            'end_line': end
-        })
-
-        start = end - overlap if end < len(lines) else end
-
-    return chunks
+# NOTE: earlier definitions of chunk_yaml (line ~87) and chunk_default (line ~118)
+# are the active ones. Earlier versions of this file had duplicate definitions
+# here that shadowed the originals — and the shadows used a line-based size
+# (MAX_CHUNK_SIZE // 10 = 300 lines per chunk) instead of characters, so any
+# file under 300 lines became a single chunk regardless of byte size. That
+# silently degraded semantic search for most markdown docs. Removed.
 
 
