@@ -681,9 +681,13 @@ def add_file(path: str, force: bool = False, db_path: Optional[str] = None) -> i
     if not force and not file_needs_indexing(abs_path, db_path):
         return 0
 
+    # Clear any prior chunks for this path before inserting fresh ones.
+    # Use delete_by_path so BOTH the Milvus collection and the FTS index are
+    # cleaned — a bare client.delete on the collection alone leaves stale FTS
+    # rows that resurface later as fragmentary chunks (e.g. lines 1-5 next to
+    # full-doc chunks after a chunker change).
     try:
-        with milvus_client(db_path) as client:
-            client.delete(collection_name=COLLECTION_NAME, filter=f'path == "{abs_path}"')
+        delete_by_path(abs_path, db_path)
     except Exception as e:
         logger.warning("Pre-delete failed for %s (continuing): %s", abs_path, e)
 

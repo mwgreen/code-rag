@@ -8,6 +8,7 @@ import contextvars
 import fnmatch
 import os
 from pathlib import Path
+from typing import Optional
 from mcp.server import Server
 from mcp import types
 
@@ -136,18 +137,35 @@ def format_results_grouped(results: list[dict]) -> str:
     return "\n".join(output)
 
 
-def format_file_list(files: dict[str, list[str]]) -> str:
-    """Format indexed files list."""
+_FILE_LIST_CAP_PER_SECTION = 1000
+
+
+def format_file_list(files: dict[str, list[str]], path_glob: Optional[str] = None) -> str:
+    """Format indexed files list. Optional path_glob filters paths via fnmatch."""
+    import fnmatch as _fn
     if not files:
         return "No files indexed."
 
+    if path_glob:
+        files = {
+            t: [p for p in paths if _fn.fnmatch(p, path_glob)]
+            for t, paths in files.items()
+        }
+        files = {t: paths for t, paths in files.items() if paths}
+        if not files:
+            return f"No indexed files match glob: {path_glob}"
+
     output = []
     for file_type, paths in sorted(files.items()):
-        output.append(f"## {file_type.title()} ({len(paths)} files)\n")
-        for path in sorted(paths)[:50]:
+        suffix = f" (filtered by {path_glob})" if path_glob else ""
+        output.append(f"## {file_type.title()} ({len(paths)} files{suffix})\n")
+        for path in sorted(paths)[:_FILE_LIST_CAP_PER_SECTION]:
             output.append(f"- {path}")
-        if len(paths) > 50:
-            output.append(f"\n...and {len(paths) - 50} more")
+        if len(paths) > _FILE_LIST_CAP_PER_SECTION:
+            output.append(
+                f"\n...and {len(paths) - _FILE_LIST_CAP_PER_SECTION} more "
+                f"(narrow with the path_glob argument, e.g. \"docs/**/*.md\")"
+            )
         output.append("")
 
     return "\n".join(output)
@@ -277,10 +295,15 @@ def register_tools(server: Server):
             ),
             types.Tool(
                 name="list_indexed",
-                description="List all indexed files grouped by type",
+                description="List indexed files grouped by type. Up to 1000 per type; pass `path_glob` to narrow.",
                 inputSchema={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "path_glob": {
+                            "type": "string",
+                            "description": "Optional fnmatch glob to filter paths, e.g. 'docs/**/*.md'"
+                        }
+                    },
                     "required": []
                 }
             ),
@@ -412,7 +435,8 @@ def register_tools(server: Server):
 
             elif name == "list_indexed":
                 files = rag_milvus.list_indexed_files(db_path=db)
-                return [types.TextContent(type="text", text=format_file_list(files))]
+                return [types.TextContent(type="text",
+                    text=format_file_list(files, path_glob=arguments.get("path_glob")))]
 
             elif name == "get_stats":
                 stats = rag_milvus.get_stats(db_path=db)

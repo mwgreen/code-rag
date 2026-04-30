@@ -46,27 +46,51 @@ One-sentence summary:"""
 
 _model = None
 _tokenizer = None
+# If the description model can't be loaded (e.g. not cached and HF_HUB_OFFLINE=1),
+# we mark it failed so we don't retry per-chunk and pay the import + lookup cost
+# repeatedly. is_enabled() will return False once this is set.
+_model_load_failed = False
 
 
 def is_enabled(db_path: str | None = None) -> bool:
     """Check if NL descriptions are enabled.
 
     Enabled by default. Disable with CODE_RAG_DESCRIPTIONS=0.
+    Also returns False if a previous load attempt failed in this process.
     """
-    return os.getenv("CODE_RAG_DESCRIPTIONS", "1") != "0"
+    if os.getenv("CODE_RAG_DESCRIPTIONS", "1") == "0":
+        return False
+    if _model_load_failed:
+        return False
+    return True
 
 
 def load_model():
-    """Load the description model (default: gemma-3-4b-it-4bit)."""
-    global _model, _tokenizer
+    """Load the description model (default: gemma-3-4b-it-4bit).
+
+    On failure, sets a process-level sticky flag so describe_chunks() short-circuits
+    on subsequent calls instead of retrying the load for every chunk.
+    """
+    global _model, _tokenizer, _model_load_failed
     if _model is not None:
         return _model, _tokenizer
+    if _model_load_failed:
+        raise RuntimeError("description model unavailable (load previously failed)")
 
     from mlx_lm import load
 
     print(f"Loading {MODEL_ID} for NL descriptions...")
     t0 = time.perf_counter()
-    _model, _tokenizer = load(MODEL_ID, tokenizer_config={"trust_remote_code": False})
+    try:
+        _model, _tokenizer = load(MODEL_ID, tokenizer_config={"trust_remote_code": False})
+    except Exception as e:
+        _model_load_failed = True
+        logger.warning(
+            "Failed to load description model %s: %s. Disabling NL descriptions for this process. "
+            "Set CODE_RAG_DESCRIPTIONS=0 to silence this, or pre-download the model.",
+            MODEL_ID, e
+        )
+        raise
     elapsed = time.perf_counter() - t0
     print(f"Description model ready ({elapsed:.1f}s)")
     return _model, _tokenizer

@@ -145,6 +145,7 @@ class ProjectWatcher:
         self._handler: Optional[FileChangeHandler] = None
         self._change_queue: asyncio.Queue = asyncio.Queue()
         self._drain_task: Optional[asyncio.Task] = None
+        self._initial_scan_task: Optional[asyncio.Task] = None
         self._pending_changes: Dict[str, str] = {}  # path -> action
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
         self._processing = False
@@ -169,8 +170,77 @@ class ProjectWatcher:
 
         self._drain_task = asyncio.create_task(self._drain_queue())
 
+        # Backfill: FSEvents only fires on changes after the watcher is up.
+        # Files that exist on disk before code-rag starts (or were added during
+        # downtime) would otherwise stay invisible. Walk the tree once and call
+        # add_file_async on each. This is cheap on a populated index because
+        # add_file's content-hash check no-ops unchanged files.
+        self._initial_scan_task = asyncio.create_task(self._initial_scan())
+
         short = Path(self.project_root).name
         _log(f"Started watching {short}/ (debounce={self.debounce_seconds}s)")
+
+    async def _initial_scan(self):
+        """One-time backfill of files that pre-date the watcher.
+
+        Reuses `_should_handle` so include/exclude semantics match FSEvents
+        exactly. Yields control regularly so search/index requests can run
+        concurrently.
+        """
+        short = Path(self.project_root).name
+        seen = 0
+        indexed = 0
+        skipped = 0
+        errors = 0
+
+        try:
+            for root, dirs, files in os.walk(self.project_root, followlinks=False):
+                # Prune excluded dirs in-place so os.walk doesn't descend into them
+                if self._handler._excluded_dirs is None:
+                    self._handler._excluded_dirs = rag_milvus.get_excluded_dirs(
+                        project_root=self.project_root)
+                dirs[:] = [d for d in dirs
+                           if d not in self._handler._excluded_dirs
+                           and not d.startswith('.')]
+
+                for fname in files:
+                    if self._stopped:
+                        return
+                    full = os.path.join(root, fname)
+                    if not self._handler._should_handle(full):
+                        continue
+                    seen += 1
+                    try:
+                        if os.path.getsize(full) > 1024 * 1024:
+                            skipped += 1
+                            continue
+                    except OSError:
+                        skipped += 1
+                        continue
+                    try:
+                        chunks = await rag_milvus.add_file_async(
+                            full, force=False, db_path=self.db_path)
+                        if chunks > 0:
+                            indexed += 1
+                            self.stats['files_indexed'] += 1
+                        else:
+                            skipped += 1
+                    except Exception as e:
+                        _log(f"{short}/: initial-scan error on {Path(full).name}: {e}")
+                        errors += 1
+                        self.stats['errors'] += 1
+
+                    # Yield to the event loop so concurrent requests don't starve
+                    if seen % 50 == 0:
+                        await asyncio.sleep(0)
+
+            _log(f"{short}/: initial scan complete — seen={seen} indexed={indexed} "
+                 f"skipped={skipped} errors={errors}")
+        except asyncio.CancelledError:
+            _log(f"{short}/: initial scan cancelled (seen={seen} indexed={indexed})")
+            raise
+        except Exception as e:
+            _log(f"{short}/: initial scan crashed: {e}")
 
     async def stop(self):
         """Stop the watcher and cancel pending work."""
@@ -187,6 +257,14 @@ class ProjectWatcher:
             except asyncio.CancelledError:
                 pass
             self._drain_task = None
+
+        if self._initial_scan_task is not None:
+            self._initial_scan_task.cancel()
+            try:
+                await self._initial_scan_task
+            except asyncio.CancelledError:
+                pass
+            self._initial_scan_task = None
 
         if self._observer is not None:
             self._observer.stop()
