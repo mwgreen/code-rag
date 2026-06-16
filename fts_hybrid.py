@@ -21,8 +21,9 @@ Usage:
 
 import logging
 import sqlite3
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("fts-hybrid")
 
@@ -42,7 +43,11 @@ class FTSIndex:
         self.table_name = table_name
         self.metadata_columns = metadata_columns
         self._indexed_metadata = indexed_metadata or set()
-        self._connections: Dict[str, sqlite3.Connection] = {}
+        # Keyed by (thread_id, fts_path): in server mode DB work is dispatched
+        # across an asyncio thread pool, and SQLite connections may only be used
+        # by the thread that created them. One connection per thread+path avoids
+        # cross-thread reuse; WAL mode lets them share the file concurrently.
+        self._connections: Dict[Tuple[int, str], sqlite3.Connection] = {}
         self._server_mode = False
 
         # Pre-compute SQL fragments
@@ -72,8 +77,8 @@ class FTSIndex:
         self._server_mode = enabled
 
     def close_all(self):
-        """Close all persistent connections."""
-        for path, conn in list(self._connections.items()):
+        """Close all persistent connections (across all threads)."""
+        for (_, path), conn in list(self._connections.items()):
             try:
                 conn.close()
                 logger.info("Closed FTS connection: %s", path)
@@ -124,28 +129,36 @@ class FTSIndex:
         conn.commit()
 
     def connection(self, milvus_db_path: str) -> sqlite3.Connection:
-        """Get or create a connection. Persistent in server mode, ephemeral otherwise."""
-        fts_path = self.db_path(milvus_db_path)
+        """Get or create a connection, scoped to the calling thread.
 
-        if fts_path in self._connections:
+        Persistent (cached per thread+path) in server mode, ephemeral otherwise.
+        Opened with check_same_thread=False so close_all() can release a thread's
+        connection from the shutdown thread; per-thread keying still ensures no
+        two threads use the same connection object during normal operation.
+        """
+        fts_path = self.db_path(milvus_db_path)
+        key = (threading.get_ident(), fts_path)
+
+        if key in self._connections:
             try:
-                self._connections[fts_path].execute("SELECT 1")
-                return self._connections[fts_path]
+                self._connections[key].execute("SELECT 1")
+                return self._connections[key]
             except Exception:
                 logger.warning("Stale FTS connection for %s — reconnecting", fts_path)
                 try:
-                    self._connections[fts_path].close()
+                    self._connections[key].close()
                 except Exception:
                     pass
-                del self._connections[fts_path]
+                del self._connections[key]
 
         Path(fts_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(fts_path)
+        conn = sqlite3.connect(fts_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         self._check_and_migrate(conn)
 
         if self._server_mode:
-            self._connections[fts_path] = conn
+            self._connections[key] = conn
             logger.info("Opened FTS connection: %s", fts_path)
 
         return conn
@@ -255,14 +268,15 @@ class FTSIndex:
         return results
 
     def clear(self, db_path: str):
-        """Delete the FTS database file. Closes persistent connection first."""
+        """Delete the FTS database file. Closes persistent connections first."""
         fts_path = self.db_path(db_path)
-        if fts_path in self._connections:
+        # Close every thread's persistent connection to this DB before unlinking.
+        for k in [k for k in self._connections if k[1] == fts_path]:
             try:
-                self._connections[fts_path].close()
+                self._connections[k].close()
             except Exception:
                 pass
-            del self._connections[fts_path]
+            del self._connections[k]
         fts_file = Path(fts_path)
         if fts_file.exists():
             fts_file.unlink()
