@@ -60,8 +60,7 @@ if [ -f "$MODEL_DIR/model.safetensors" ] || [ -f "$MODEL_DIR/model-00001-of-0000
     echo "Size: $(du -sh "$MODEL_DIR" | cut -f1)"
     echo "======================================================================"
     echo ""
-    echo "To use this model, set the environment variable:"
-    echo "  export EMBED_MODEL_PATH=$MODEL_DIR"
+    echo "This is the default embedding model — no env var needed."
     echo ""
     echo "Note: Switching models requires re-indexing your projects."
 else

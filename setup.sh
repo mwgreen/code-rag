@@ -133,26 +133,17 @@ fi
 # Create data directory
 mkdir -p data
 
-# Download and quantize embedding model
+# Download and quantize embedding model (default: SFR-Embedding-Code-2B)
 echo ""
-"$SCRIPT_DIR/download-model.sh"
+"$SCRIPT_DIR/download-sfr-embed.sh"
 
-# Pre-download NL description models (used with CODE_RAG_DESCRIPTIONS=1)
+# Pre-download NL description model (default: Gemma 3 4B; descriptions on by default)
 echo ""
-echo "Pre-downloading NL description models..."
-"$PYTHON" << 'DESCEOF'
+echo "Pre-downloading NL description model (Gemma 3 4B)..."
+python3 << 'DESCEOF'
 from mlx_lm import load
 
-# Default: Qwen3-4B
-try:
-    print("  Downloading Qwen3-4B-MLX-4bit (~2.5 GB)...")
-    model, tokenizer = load("Qwen/Qwen3-4B-MLX-4bit", tokenizer_config={"trust_remote_code": False})
-    print("  Qwen3-4B cached for offline use")
-    del model, tokenizer
-except Exception as e:
-    print(f"  Qwen3-4B download skipped: {e}")
-
-# Alternative: Gemma 3 4B
+# Default description model: Gemma 3 4B
 try:
     print("  Downloading gemma-3-4b-it-4bit (~2.5 GB)...")
     model, tokenizer = load("mlx-community/gemma-3-4b-it-4bit", tokenizer_config={"trust_remote_code": False})
@@ -161,7 +152,7 @@ try:
 except Exception as e:
     print(f"  Gemma-3-4B download skipped: {e}")
 
-print("  (enable descriptions with CODE_RAG_DESCRIPTIONS=1)")
+print("  (descriptions are on by default; disable with CODE_RAG_DESCRIPTIONS=0)")
 DESCEOF
 
 # Test installation
@@ -232,7 +223,8 @@ echo "======================================================================"
 echo "Installation Complete!"
 echo "======================================================================"
 echo ""
-echo "Default embedding model: Qodo-Embed-1-1.5B (Q8, 1536 dims, MLX)"
+echo "Default embedding model: SFR-Embedding-Code-2B (Q8, 2304 dims, MLX)"
+echo "Default description model: Gemma 3 4B (MLX, on by default)"
 echo ""
 echo "Next steps:"
 echo ""
@@ -249,12 +241,12 @@ echo "   - Restart Claude Code"
 echo ""
 echo "Optional: Alternative models"
 echo ""
-echo "  Embedding (SFR-Embedding-Code-2B, Gemma 2, 2304 dims):"
-echo "    ./download-sfr-embed.sh"
-echo "    export EMBED_MODEL_PATH=./models/sfr-embed-code-2b-mlx-q8"
+echo "  Embedding (Qodo-Embed-1-1.5B, Qwen2, 1536 dims):"
+echo "    ./download-model.sh"
+echo "    export EMBED_MODEL_PATH=./models/qodo-embed-1-1.5b-mlx-q8"
 echo ""
-echo "  NL descriptions (Gemma 3 4B instead of Qwen3 4B):"
-echo "    export CODE_RAG_DESCRIPTION_MODEL=mlx-community/gemma-3-4b-it-4bit"
+echo "  NL descriptions (Qwen3 4B instead of Gemma 3 4B):"
+echo "    export CODE_RAG_DESCRIPTION_MODEL=Qwen/Qwen3-4B-MLX-4bit"
 echo ""
 echo "  Note: Switching embedding models requires re-indexing."
 echo ""
