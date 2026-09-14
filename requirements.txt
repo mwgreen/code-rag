@@ -29,4 +29,4 @@ python-dotenv>=1.0.0
 pyyaml>=6.0
 
 # Optional: MCP server for Claude Code integration
-mcp>=1.0.0
+mcp>=1.0.0,<2.0  # 2.x removed Server.list_tools() decorator used in tools.py
