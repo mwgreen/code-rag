@@ -1,14 +1,18 @@
 #!/bin/bash
-# Wrapper script to run indexer with venv Python
-# Defaults to parent directory if no path specified
-# DB is stored at {target_path}/.code-rag/milvus.db
+# Index a project: ./index.sh /path/to/project [--full] [--clear] [...]
+# The index is stored at {project}/.code-rag/milvus.db.
+# If the code-rag server is running, indexing is delegated to it (no need to stop it).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Use provided path or default to project root
-TARGET_PATH="${1:-$PROJECT_ROOT}"
+if [ $# -lt 1 ] || [[ "$1" == --* ]]; then
+    echo "Usage: $0 /path/to/project [--full] [--clear] [--extensions .java,.ts] [--local] [-v]" >&2
+    echo "  (a project path is required; the old default of indexing the parent directory was removed)" >&2
+    exit 2
+fi
+
+TARGET_PATH="$1"
+shift
 
 export PYTHONPATH="$SCRIPT_DIR"
-
-"$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/index_codebase.py" --path "$TARGET_PATH" "${@:2}"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/index_codebase.py" --path "$TARGET_PATH" "$@"

@@ -51,17 +51,12 @@ Key dependencies: `pymilvus[milvus-lite]`, `mlx-embeddings`, `mlx`, `starlette`,
 
 **Important:** `transformers` must be 5.x. `mlx-embeddings>=0.1.0` and `mlx-lm>=0.31` both require it (older code-rag installs pinned `<5.0` for mlx-embeddings 0.0.x; upgrading the venv means upgrading transformers too).
 
-### 3. Legacy Architecture Patches (optional)
+### 3. Legacy Architecture Patches (automatic)
 
-The default Qwen3-Embedding models are supported natively by `mlx-embeddings>=0.1.0`. Only the
-legacy models need a patch copied into the package: Qodo-Embed (Qwen2) and SFR-Embedding-Code
-(CodexEmbed2B). `setup.sh` installs both; by hand:
-
-```bash
-MLX_MODELS_DIR=$(python3 -c "import mlx_embeddings.models; import os; print(os.path.dirname(mlx_embeddings.models.__file__))")
-cp patches/mlx_embeddings_qwen2.py "$MLX_MODELS_DIR/qwen2.py"
-cp patches/mlx_embeddings_codexembed2b.py "$MLX_MODELS_DIR/codexembed2b.py"
-```
+The default Qwen3-Embedding models are supported natively by `mlx-embeddings>=0.1.0`. The legacy
+models (Qodo-Embed = Qwen2, SFR-Embedding-Code = CodexEmbed2B) need the implementations under
+`patches/`; `rag_milvus` registers them into `sys.modules` at load time, so nothing is copied into
+site-packages and pip upgrades cannot break them.
 
 ### 4. Models
 

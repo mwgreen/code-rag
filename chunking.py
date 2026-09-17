@@ -1,24 +1,21 @@
 """
 Code chunking utilities - AST-based when possible, regex fallback.
-Uses tree-sitter for semantic chunking of Java, Python, TypeScript, JavaScript.
+Uses code-chunk (Node.js) for contextualized chunks, tree-sitter as the second
+choice, and regex/size-based splitting as the last resort.
 """
 
+import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
 import yaml
 
-# Try to import code-chunk wrapper (best quality - has context features)
-try:
-    from codechunk_wrapper import chunk_with_codechunk
-    CODECHUNK_AVAILABLE = True
-    print("[DEBUG] code-chunk available")
-except ImportError as e:
-    CODECHUNK_AVAILABLE = False
-    chunk_with_codechunk = None
-    print(f"[DEBUG] code-chunk not available: {e}")
+import codechunk_wrapper
+from codechunk_wrapper import chunk_with_codechunk
+
+logger = logging.getLogger("code-rag.chunking")
 
 # Fallback: tree-sitter AST chunking
 try:
@@ -34,6 +31,21 @@ load_dotenv()
 # Configuration
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
 MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "50"))
+
+CODECHUNK_LANGUAGES = ('java', 'python', 'typescript', 'javascript', 'rust', 'go')
+AST_LANGUAGES = ('java', 'python', 'typescript', 'javascript')
+
+
+def chunker_status() -> Dict:
+    """Which chunker is active, for /health."""
+    st = codechunk_wrapper.status()
+    if st["available"]:
+        active = "code-chunk"
+    elif AST_AVAILABLE:
+        active = "tree-sitter"
+    else:
+        active = "regex"
+    return {"active": active, **st}
 
 
 def detect_language(path: str) -> str:
@@ -175,79 +187,54 @@ def chunk_default(content: str, path: str) -> List[Dict]:
     return chunks
 
 
+def _regex_chunk(content: str, lang: str, path: str) -> List[Dict]:
+    if lang == 'java':
+        return chunk_java(content, path)
+    if lang == 'javascript':
+        return chunk_javascript(content, path)
+    if lang == 'typescript':
+        return chunk_typescript(content, path)
+    if lang == 'yaml':
+        return chunk_yaml(content, path)
+    return chunk_default(content, path)
+
+
 def chunk_file(path: str) -> List[Dict]:
-    """Chunk a file using AST when possible, regex fallback."""
+    """Chunk a file: code-chunk, then tree-sitter, then regex/size fallback.
+
+    Files that are not valid UTF-8 are decoded with replacement characters rather
+    than skipped: one Latin-1 comment used to drop a whole file from the index.
+    """
+    if not path:
+        return []
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
     except Exception as e:
-        print(f"Error reading {path}: {e}")
+        logger.warning("Error reading %s: %s", path, e)
+        return []
+    if not content.strip():
         return []
 
     lang = detect_language(path)
+    chunks: Optional[List[Dict]] = None
 
-    # Try code-chunk first (best - has full context: scope, imports, signatures)
-    if CODECHUNK_AVAILABLE and lang in ['java', 'python', 'typescript', 'javascript', 'rust', 'go']:
+    if lang in CODECHUNK_LANGUAGES and codechunk_wrapper.available():
         chunks = chunk_with_codechunk(content, path, lang)
-        if chunks:
-            # code-chunk succeeded - use contextualized chunks
-            pass  # chunks already set
-        # code-chunk failed, try tree-sitter AST
-        elif AST_AVAILABLE:
-            ast_chunks = chunk_code_ast(content, lang, path)
-            if ast_chunks:
-                chunks = ast_chunks
-            else:
-                # Both failed, use regex
-                if lang == 'java':
-                    chunks = chunk_java(content, path)
-                elif lang == 'javascript':
-                    chunks = chunk_javascript(content, path)
-                elif lang == 'typescript':
-                    chunks = chunk_typescript(content, path)
-                else:
-                    chunks = chunk_default(content, path)
-        else:
-            # code-chunk failed, no AST available, use regex
-            if lang == 'java':
-                chunks = chunk_java(content, path)
-            elif lang == 'javascript':
-                chunks = chunk_javascript(content, path)
-            elif lang == 'typescript':
-                chunks = chunk_typescript(content, path)
-            else:
-                chunks = chunk_default(content, path)
-    # Try AST-based chunking if code-chunk not available
-    elif AST_AVAILABLE and lang in ['java', 'python', 'typescript', 'javascript']:
-        ast_chunks = chunk_code_ast(content, lang, path)
-        if ast_chunks:
-            chunks = ast_chunks
-        else:
-            # AST failed, fall back to regex
-            if lang == 'java':
-                chunks = chunk_java(content, path)
-            elif lang == 'javascript':
-                chunks = chunk_javascript(content, path)
-            elif lang == 'typescript':
-                chunks = chunk_typescript(content, path)
-            else:
-                chunks = chunk_default(content, path)
-    # For other languages, use language-specific chunker
-    elif lang == 'yaml':
-        chunks = chunk_yaml(content, path)
-    else:
-        chunks = chunk_default(content, path)
+    if not chunks and AST_AVAILABLE and lang in AST_LANGUAGES:
+        chunks = chunk_code_ast(content, lang, path)
+    if not chunks:
+        chunks = _regex_chunk(content, lang, path)
 
     # Ensure all chunks have metadata (some chunkers already add it)
     for chunk in chunks:
-        if 'path' not in chunk:
-            chunk['path'] = path
-        if 'language' not in chunk:
-            chunk['language'] = lang
-        if 'type' not in chunk:
-            chunk['type'] = detect_type(path, lang)
+        chunk.setdefault('path', path)
+        chunk.setdefault('language', lang)
+        chunk.setdefault('type', detect_type(path, lang))
 
     return chunks
+
+
 def chunk_java(content: str, path: str) -> List[Dict]:
     """Chunk Java code by class and method boundaries."""
     chunks = []

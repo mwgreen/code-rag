@@ -112,27 +112,11 @@ pip install --quiet "mcp>=1.0.0,<2.0" || echo "  MCP install failed (optional, c
 
 echo "  All dependencies installed"
 
-# Install architecture patches for mlx-embeddings.
-# Only the legacy models (Qodo-Embed = qwen2, SFR-Embedding-Code = codexembed2b) need
-# these; Qwen3-Embedding is supported natively. Installed anyway so the legacy
-# profile keeps working. A file already shipped by the package is never overwritten.
+# Legacy embedding architectures (Qodo-Embed = qwen2, SFR-Embedding-Code = codexembed2b)
+# are registered at runtime from patches/ by rag_milvus.register_legacy_architecture;
+# nothing is copied into site-packages any more, so pip upgrades cannot break them.
 echo ""
-echo "Installing legacy architecture patches for mlx-embeddings..."
-MLX_MODELS_DIR=$(python3 -c "import mlx_embeddings.models; import os; print(os.path.dirname(mlx_embeddings.models.__file__))")
-if [ -n "$MLX_MODELS_DIR" ]; then
-    for patch in qwen2 codexembed2b; do
-        if [ ! -f "patches/mlx_embeddings_${patch}.py" ]; then
-            echo "  Warning: patches/mlx_embeddings_${patch}.py not found"
-        elif [ -f "$MLX_MODELS_DIR/${patch}.py" ] && ! cmp -s "patches/mlx_embeddings_${patch}.py" "$MLX_MODELS_DIR/${patch}.py"; then
-            echo "  mlx-embeddings already ships ${patch}.py; leaving it alone"
-        else
-            cp "patches/mlx_embeddings_${patch}.py" "$MLX_MODELS_DIR/${patch}.py"
-            echo "  ${patch} architecture installed (legacy models only)"
-        fi
-    done
-else
-    echo "  Warning: Could not find mlx-embeddings models directory"
-fi
+echo "Legacy architecture patches: loaded from patches/ at runtime (no site-packages changes)"
 
 # Create data directory
 mkdir -p data
@@ -239,6 +223,8 @@ echo "                        export CODE_RAG_EMBED_MODEL=qwen3-embed-0.6b"
 echo "  Descriptions only:    ./download-description-model.sh qwen3-4b-2507"
 echo "                        export CODE_RAG_DESCRIPTION_MODEL_KEY=qwen3-4b-2507"
 echo "  List everything:      venv/bin/python model_config.py --list"
+echo ""
+echo "Run the test suite:     ./run-tests.sh"
 echo ""
 echo "  Note: switching embedding models requires re-indexing (./index.sh --force)."
 echo ""

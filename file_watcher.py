@@ -1,24 +1,32 @@
 """
 File watcher for automatic incremental reindexing.
 
-Uses macOS FSEvents (via watchdog) to detect file changes and reindex
-affected files in batches. Designed to handle burst scenarios like
-git checkout without degrading search performance.
+Uses macOS FSEvents (via watchdog) to detect file changes and reindex affected
+files in batches. Designed to handle burst scenarios like git checkout without
+degrading search performance.
 
-Pipeline: FSEvents -> watchdog thread -> filter -> asyncio.Queue -> debounce -> batch process
+Pipeline: FSEvents -> watchdog thread -> IndexRules filter -> asyncio.Queue -> debounce -> batch
+
+FSEvents is not a reliable source of truth: it drops events under heavy bursts
+and cannot report what happened while the server was down. So the watcher also
+runs a reconcile job (disk vs Milvus vs FTS) at start, after .git/HEAD changes,
+after .ragignore/.ragconfig changes, and on a timer.
 """
 
 import asyncio
-import fnmatch
+import logging
 import os
-import sys
 from pathlib import Path
 from typing import Dict, Optional
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+import jobs
 import rag_milvus
+from indexing_rules import IndexRules
+
+logger = logging.getLogger("code-rag.watcher")
 
 # --- Configuration ---
 
@@ -27,107 +35,65 @@ _watcher_config = {
     'debounce_seconds': float(os.getenv('CODE_RAG_WATCH_DEBOUNCE', '2.0')),
     'max_batch_size': int(os.getenv('CODE_RAG_WATCH_MAX_BATCH', '100')),
     'git_settle_seconds': float(os.getenv('CODE_RAG_WATCH_GIT_SETTLE', '3.0')),
+    # Full disk/index/FTS reconcile on this interval (seconds). 0 disables the timer.
+    'reconcile_interval': float(os.getenv('CODE_RAG_RECONCILE_INTERVAL', str(6 * 3600))),
 }
-
-# File extensions to watch (matches index_directory defaults)
-_WATCH_EXTENSIONS = {
-    '.java', '.js', '.ts', '.tsx', '.jsx', '.json',
-    '.xml', '.yaml', '.yml', '.md', '.gradle', '.properties',
-    # API schemas — these are the canonical contract for GraphQL/proto/etc.
-    # behavior. Without them indexed, agents can't answer "what does the API
-    # accept" questions and confabulate from prose docs instead.
-    '.graphql', '.graphqls', '.proto',
-}
-
-
-def _log(msg: str):
-    print(f"[watcher] {msg}", file=sys.stderr)
 
 
 # --- FileChangeHandler ---
 
 class FileChangeHandler(FileSystemEventHandler):
-    """Watchdog event handler that filters and forwards changes to asyncio."""
+    """Watchdog event handler that filters through IndexRules and forwards to asyncio."""
 
-    def __init__(self, project_root: str, change_queue: asyncio.Queue,
+    def __init__(self, rules: IndexRules, change_queue: asyncio.Queue,
                  loop: asyncio.AbstractEventLoop):
         super().__init__()
-        self.project_root = project_root
+        self.rules = rules
         self.change_queue = change_queue
         self.loop = loop
-        self._excluded_dirs: Optional[set] = None
 
-    def _should_handle(self, path: str) -> bool:
-        """Fast pre-filter. Runs in watchdog thread — must be cheap."""
-        p = Path(path)
-        # Config files trigger reload (handled specially in _process_batch)
-        if p.name in ('.ragignore', '.ragconfig'):
-            return True
-        # Extension check
-        if p.suffix not in _WATCH_EXTENSIONS:
-            return False
-        # Dotfiles
-        if p.name.startswith('.'):
-            return False
-        # TypeScript declaration files
-        if p.name.endswith('.d.ts'):
-            return False
-        # Lazy-load excluded dirs (once per handler)
-        if self._excluded_dirs is None:
-            self._excluded_dirs = rag_milvus.get_excluded_dirs(
-                project_root=self.project_root)
-        # Excluded directories
-        if self._excluded_dirs & set(p.parts):
-            return False
-        # .ragconfig exclusions
-        ragconfig = rag_milvus.load_ragconfig(self.project_root)
-        if p.suffix in ragconfig.get('exclude_extensions', []):
-            return False
-        exclude_patterns = ragconfig.get('exclude_patterns', [])
-        if exclude_patterns:
-            try:
-                rel_path = os.path.relpath(path, self.project_root)
-                if any(fnmatch.fnmatch(rel_path, pat) for pat in exclude_patterns):
-                    return False
-            except ValueError:
-                pass
-        # Skip large files (>1MB)
-        try:
-            if p.exists() and p.stat().st_size > 1024 * 1024:
-                return False
-        except OSError:
-            pass
-        return True
+    def _classify(self, path: str, deleted: bool = False) -> Optional[str]:
+        """'config' | 'git' | 'file' | None. Runs in the watchdog thread; must be cheap."""
+        if self.rules.is_config_file(path):
+            return 'config'
+        if self.rules.is_git_ref_file(path):
+            return 'git'
+        if deleted:
+            # The file is gone, so skip the stat/content checks; anything that
+            # would otherwise have been indexable must be removed.
+            reason = self.rules.exclusion_reason(path, size=0)
+            return 'file' if reason in (None, 'missing') else None
+        return 'file' if self.rules.should_index(path) else None
 
     def _enqueue(self, action: str, path: str):
-        """Thread-safe enqueue to asyncio loop."""
         try:
-            self.loop.call_soon_threadsafe(
-                self.change_queue.put_nowait,
-                (action, path)
-            )
+            self.loop.call_soon_threadsafe(self.change_queue.put_nowait, (action, path))
         except RuntimeError:
-            pass  # Loop closed during shutdown
+            pass  # loop closed during shutdown
+
+    def _handle(self, path: str, action: str):
+        kind = self._classify(path, deleted=(action == 'deleted'))
+        if kind == 'file':
+            self._enqueue(action, path)
+        elif kind is not None:
+            self._enqueue(kind, path)
 
     def on_modified(self, event):
-        if not event.is_directory and self._should_handle(event.src_path):
-            self._enqueue('modified', event.src_path)
+        if not event.is_directory:
+            self._handle(event.src_path, 'modified')
 
     def on_created(self, event):
-        if not event.is_directory and self._should_handle(event.src_path):
-            self._enqueue('created', event.src_path)
+        if not event.is_directory:
+            self._handle(event.src_path, 'created')
 
     def on_deleted(self, event):
-        if not event.is_directory and self._should_handle(event.src_path):
-            self._enqueue('deleted', event.src_path)
+        if not event.is_directory:
+            self._handle(event.src_path, 'deleted')
 
     def on_moved(self, event):
         if not event.is_directory:
-            # Decompose move into delete + create
-            if self._should_handle(event.src_path):
-                self._enqueue('deleted', event.src_path)
-            if self._should_handle(event.dest_path):
-                self._enqueue('created', event.dest_path)
+            self._handle(event.src_path, 'deleted')
+            self._handle(event.dest_path, 'created')
 
 
 # --- ProjectWatcher ---
@@ -138,121 +104,86 @@ class ProjectWatcher:
     def __init__(self, project_root: str, db_path: str,
                  debounce_seconds: float = 2.0,
                  max_batch_size: int = 100,
-                 git_settle_seconds: float = 3.0):
+                 git_settle_seconds: float = 3.0,
+                 reconcile_interval: float = 6 * 3600):
         self.project_root = project_root
         self.db_path = db_path
         self.debounce_seconds = debounce_seconds
         self.max_batch_size = max_batch_size
         self.git_settle_seconds = git_settle_seconds
+        self.reconcile_interval = reconcile_interval
+        self.rules = IndexRules(project_root)
 
         self._observer: Optional[Observer] = None
         self._handler: Optional[FileChangeHandler] = None
         self._change_queue: asyncio.Queue = asyncio.Queue()
         self._drain_task: Optional[asyncio.Task] = None
-        self._initial_scan_task: Optional[asyncio.Task] = None
         self._pending_changes: Dict[str, str] = {}  # path -> action
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
+        self._periodic_handle: Optional[asyncio.TimerHandle] = None
         self._processing = False
         self._stopped = False
+        self._reconcile_job: Optional[jobs.Job] = None
         self.stats = {
             'files_indexed': 0,
             'files_deleted': 0,
             'batches_processed': 0,
+            'reconciles': 0,
             'errors': 0,
         }
 
+    @property
+    def short(self) -> str:
+        return Path(self.project_root).name
+
     async def start(self):
-        """Start watching the project directory."""
-        loop = asyncio.get_event_loop()
-        handler = FileChangeHandler(self.project_root, self._change_queue, loop)
-        self._handler = handler
+        loop = asyncio.get_running_loop()
+        self._handler = FileChangeHandler(self.rules, self._change_queue, loop)
 
         self._observer = Observer()
-        self._observer.schedule(handler, self.project_root, recursive=True)
+        self._observer.schedule(self._handler, self.project_root, recursive=True)
         self._observer.daemon = True
         self._observer.start()
 
         self._drain_task = asyncio.create_task(self._drain_queue())
 
-        # Backfill: FSEvents only fires on changes after the watcher is up.
-        # Files that exist on disk before code-rag starts (or were added during
-        # downtime) would otherwise stay invisible. Walk the tree once and call
-        # add_file_async on each. This is cheap on a populated index because
-        # add_file's content-hash check no-ops unchanged files.
-        self._initial_scan_task = asyncio.create_task(self._initial_scan())
+        # Backfill anything that changed while the server was down, and repair
+        # any drift between Milvus and FTS. Runs as a background job.
+        self.kick_reconcile("watcher start")
+        self._schedule_periodic()
 
-        short = Path(self.project_root).name
-        _log(f"Started watching {short}/ (debounce={self.debounce_seconds}s)")
+        logger.info("Started watching %s/ (debounce=%.1fs, reconcile every %.0fs)",
+                    self.short, self.debounce_seconds, self.reconcile_interval)
 
-    async def _initial_scan(self):
-        """One-time backfill of files that pre-date the watcher.
+    def kick_reconcile(self, reason: str) -> Optional[jobs.Job]:
+        if self._stopped:
+            return None
+        job = jobs.start_reconcile_job(self.project_root, self.db_path, reason=reason)
+        if job.kind == 'reconcile' and job is not self._reconcile_job:
+            self.stats['reconciles'] += 1
+            logger.info("%s/: reconcile started (%s, job %s)", self.short, reason, job.id)
+        self._reconcile_job = job
+        return job
 
-        Reuses `_should_handle` so include/exclude semantics match FSEvents
-        exactly. Yields control regularly so search/index requests can run
-        concurrently.
-        """
-        short = Path(self.project_root).name
-        seen = 0
-        indexed = 0
-        skipped = 0
-        errors = 0
+    def _schedule_periodic(self):
+        if self.reconcile_interval <= 0 or self._stopped:
+            return
+        loop = asyncio.get_running_loop()
+        self._periodic_handle = loop.call_later(self.reconcile_interval, self._periodic_tick)
 
-        try:
-            for root, dirs, files in os.walk(self.project_root, followlinks=False):
-                # Prune excluded dirs in-place so os.walk doesn't descend into them
-                if self._handler._excluded_dirs is None:
-                    self._handler._excluded_dirs = rag_milvus.get_excluded_dirs(
-                        project_root=self.project_root)
-                dirs[:] = [d for d in dirs
-                           if d not in self._handler._excluded_dirs
-                           and not d.startswith('.')]
-
-                for fname in files:
-                    if self._stopped:
-                        return
-                    full = os.path.join(root, fname)
-                    if not self._handler._should_handle(full):
-                        continue
-                    seen += 1
-                    try:
-                        if os.path.getsize(full) > 1024 * 1024:
-                            skipped += 1
-                            continue
-                    except OSError:
-                        skipped += 1
-                        continue
-                    try:
-                        chunks = await rag_milvus.add_file_async(
-                            full, force=False, db_path=self.db_path)
-                        if chunks > 0:
-                            indexed += 1
-                            self.stats['files_indexed'] += 1
-                        else:
-                            skipped += 1
-                    except Exception as e:
-                        _log(f"{short}/: initial-scan error on {Path(full).name}: {e}")
-                        errors += 1
-                        self.stats['errors'] += 1
-
-                    # Yield to the event loop so concurrent requests don't starve
-                    if seen % 50 == 0:
-                        await asyncio.sleep(0)
-
-            _log(f"{short}/: initial scan complete — seen={seen} indexed={indexed} "
-                 f"skipped={skipped} errors={errors}")
-        except asyncio.CancelledError:
-            _log(f"{short}/: initial scan cancelled (seen={seen} indexed={indexed})")
-            raise
-        except Exception as e:
-            _log(f"{short}/: initial scan crashed: {e}")
+    def _periodic_tick(self):
+        if self._stopped:
+            return
+        self.kick_reconcile("periodic")
+        self._schedule_periodic()
 
     async def stop(self):
-        """Stop the watcher and cancel pending work."""
         self._stopped = True
-
-        if self._debounce_handle is not None:
-            self._debounce_handle.cancel()
-            self._debounce_handle = None
+        for handle in (self._debounce_handle, self._periodic_handle):
+            if handle is not None:
+                handle.cancel()
+        self._debounce_handle = None
+        self._periodic_handle = None
 
         if self._drain_task is not None:
             self._drain_task.cancel()
@@ -262,249 +193,135 @@ class ProjectWatcher:
                 pass
             self._drain_task = None
 
-        if self._initial_scan_task is not None:
-            self._initial_scan_task.cancel()
-            try:
-                await self._initial_scan_task
-            except asyncio.CancelledError:
-                pass
-            self._initial_scan_task = None
+        if self._reconcile_job is not None and self._reconcile_job.active:
+            self._reconcile_job.cancel.set()
 
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
 
-        short = Path(self.project_root).name
-        _log(f"Stopped watching {short}/ "
-             f"(indexed={self.stats['files_indexed']}, "
-             f"deleted={self.stats['files_deleted']}, "
-             f"batches={self.stats['batches_processed']})")
+        logger.info("Stopped watching %s/ (indexed=%d, deleted=%d, batches=%d, reconciles=%d)",
+                    self.short, self.stats['files_indexed'], self.stats['files_deleted'],
+                    self.stats['batches_processed'], self.stats['reconciles'])
 
     async def _drain_queue(self):
         """Continuously read events from the queue into the pending set."""
         try:
             while True:
                 action, path = await self._change_queue.get()
-
-                # Merge logic: delete always wins over prior actions
                 existing = self._pending_changes.get(path)
-                if action == 'deleted':
+                if action in ('config', 'git'):
+                    self._pending_changes[path] = action
+                elif action == 'deleted':
                     self._pending_changes[path] = 'deleted'
                 elif existing == 'deleted':
-                    # Was deleted, now recreated -> modified
-                    self._pending_changes[path] = 'modified'
+                    self._pending_changes[path] = 'modified'  # deleted then recreated
                 else:
                     self._pending_changes[path] = action
-
                 self._reset_debounce()
         except asyncio.CancelledError:
             pass
 
     def _reset_debounce(self):
-        """Reset the debounce timer. Called each time a new event arrives."""
         if self._debounce_handle is not None:
             self._debounce_handle.cancel()
-
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._debounce_handle = loop.call_later(
-            self.debounce_seconds,
-            lambda: asyncio.ensure_future(self._trigger_processing())
-        )
+            self.debounce_seconds, lambda: asyncio.ensure_future(self._trigger_processing()))
 
     async def _trigger_processing(self):
-        """Called when debounce timer fires."""
         if self._stopped:
             return
-
-        # Check if git is mid-operation
         if self._is_git_active():
-            short = Path(self.project_root).name
-            _log(f"{short}/: Git operation in progress, deferring {self.git_settle_seconds}s...")
-            loop = asyncio.get_event_loop()
+            logger.info("%s/: git operation in progress, deferring %.0fs", self.short, self.git_settle_seconds)
+            loop = asyncio.get_running_loop()
             self._debounce_handle = loop.call_later(
-                self.git_settle_seconds,
-                lambda: asyncio.ensure_future(self._trigger_processing())
-            )
+                self.git_settle_seconds, lambda: asyncio.ensure_future(self._trigger_processing()))
             return
-
-        # Don't start a new batch while one is processing
         if self._processing:
             self._reset_debounce()
             return
-
         await self._process_batch()
 
     def _is_git_active(self) -> bool:
-        """Check if git is mid-operation (.git/index.lock exists)."""
         git_dir = Path(self.project_root) / '.git'
-        if not git_dir.is_dir():
-            return False
-        return (git_dir / 'index.lock').exists()
-
-    async def _cleanup_excluded_files(self):
-        """Remove indexed files that are now excluded by .ragignore/.ragconfig."""
-        loop = asyncio.get_event_loop()
-        short = Path(self.project_root).name
-
-        excluded_dirs = rag_milvus.get_excluded_dirs(project_root=self.project_root)
-        ragconfig = rag_milvus.load_ragconfig(self.project_root)
-        exclude_ext = set(ragconfig.get('exclude_extensions', []))
-        exclude_patterns = ragconfig.get('exclude_patterns', [])
-
-        indexed = await loop.run_in_executor(None,
-            lambda: rag_milvus.list_indexed_files(db_path=self.db_path))
-
-        all_paths = []
-        for paths in indexed.values():
-            all_paths.extend(paths)
-
-        removed = 0
-        for path in all_paths:
-            p = Path(path)
-            should_exclude = False
-
-            if excluded_dirs & set(p.parts):
-                should_exclude = True
-            elif p.suffix in exclude_ext:
-                should_exclude = True
-            elif exclude_patterns:
-                try:
-                    rel_path = os.path.relpath(path, self.project_root)
-                    if any(fnmatch.fnmatch(rel_path, pat) for pat in exclude_patterns):
-                        should_exclude = True
-                except ValueError:
-                    pass
-
-            if should_exclude:
-                await rag_milvus.delete_by_path_async(path, self.db_path)
-                removed += 1
-
-        if removed:
-            _log(f"{short}/: Config reload — removed {removed} now-excluded files")
+        return git_dir.is_dir() and (git_dir / 'index.lock').exists()
 
     async def _process_batch(self):
-        """Process accumulated changes."""
         if not self._pending_changes:
             return
-
         self._processing = True
-        short = Path(self.project_root).name
 
-        # Snapshot and clear — new events accumulate in a fresh dict
         batch = dict(self._pending_changes)
         self._pending_changes.clear()
 
-        # Check for config file changes
-        config_files = {p for p in batch if Path(p).name in ('.ragignore', '.ragconfig')}
-        if config_files:
-            # Remove config files from normal processing
-            for cf in config_files:
-                batch.pop(cf, None)
-            # Invalidate caches and reload
-            rag_milvus.invalidate_ragconfig(self.project_root)
-            if self._handler:
-                self._handler._excluded_dirs = None
-            _log(f"{short}/: Config file changed — reloading exclusions")
-            try:
-                await self._cleanup_excluded_files()
-            except Exception as e:
-                _log(f"{short}/: Config reload cleanup error: {e}")
-
-        # Cap batch size, re-queue overflow
-        if len(batch) > self.max_batch_size:
-            items = list(batch.items())
-            overflow = dict(items[self.max_batch_size:])
-            batch = dict(items[:self.max_batch_size])
-            self._pending_changes.update(overflow)
-            _log(f"{short}/: Large batch, processing {len(batch)} now, "
-                 f"{len(overflow)} deferred")
-
-        deletes = {p for p, a in batch.items() if a == 'deleted'}
-        upserts = {p for p, a in batch.items() if a != 'deleted'}
-
-        indexed = 0
-        deleted = 0
-        skipped = 0
-        errors = 0
-
         try:
-            loop = asyncio.get_event_loop()
+            config_changed = any(a == 'config' for a in batch.values())
+            git_changed = any(a == 'git' for a in batch.values())
+            batch = {p: a for p, a in batch.items() if a not in ('config', 'git')}
 
-            # Phase 1: Handle deletes (fast, no embedding)
-            for path in deletes:
+            if config_changed:
+                self.rules.reload()
+                rag_milvus.invalidate_ragconfig(self.project_root)
+                logger.info("%s/: .ragignore/.ragconfig changed, reloading rules", self.short)
+                self.kick_reconcile("config change")
+            elif git_changed:
+                # Checkout/rebase: FSEvents may have dropped events for some of the
+                # files it touched, so a reconcile pass follows the per-file work.
+                self.kick_reconcile("git ref change")
+
+            if len(batch) > self.max_batch_size:
+                items = list(batch.items())
+                overflow = dict(items[self.max_batch_size:])
+                batch = dict(items[:self.max_batch_size])
+                self._pending_changes.update(overflow)
+                logger.info("%s/: large batch, processing %d now, %d deferred",
+                            self.short, len(batch), len(overflow))
+
+            deletes = {p for p, a in batch.items() if a == 'deleted'}
+            upserts = {p for p, a in batch.items() if a != 'deleted'}
+
+            indexed = deleted = skipped = errors = 0
+
+            for path in sorted(deletes):
                 try:
-                    count = await rag_milvus.delete_by_path_async(path, self.db_path)
-                    if count > 0:
+                    if await rag_milvus.delete_by_path_async(path, self.db_path) > 0:
                         deleted += 1
                     else:
                         skipped += 1
                 except Exception as e:
-                    _log(f"Error deleting {Path(path).name}: {e}")
+                    logger.warning("%s/: error deleting %s: %s", self.short, Path(path).name, e)
                     errors += 1
 
-            # Phase 2: Handle upserts (embed + write, one at a time)
-            for path in upserts:
-                # File may have disappeared between event and processing
-                if not Path(path).exists():
+            for path in sorted(upserts):
+                if not self.rules.should_index(path):   # vanished, grew too large, etc.
                     skipped += 1
                     continue
                 try:
-                    if Path(path).stat().st_size > 1024 * 1024:
-                        skipped += 1
-                        continue
-                except OSError:
-                    skipped += 1
-                    continue
-
-                try:
-                    chunks = await rag_milvus.add_file_async(
-                        path, force=False, db_path=self.db_path)
-                    if chunks > 0:
+                    if await rag_milvus.add_file_async(path, force=False, db_path=self.db_path) > 0:
                         indexed += 1
                     else:
                         skipped += 1
                 except Exception as e:
-                    _log(f"Error indexing {Path(path).name}: {e}")
+                    logger.warning("%s/: error indexing %s: %s", self.short, Path(path).name, e)
                     errors += 1
-
-                # Yield control so search requests can proceed
-                await asyncio.sleep(0)
-
-            # MLX cache cleanup
-            if indexed > 0 and indexed % 20 == 0:
-                try:
-                    import mlx.core as mx
-                    from mlx_gpu import GPU
-                    with GPU:
-                        mx.clear_cache()
-                except Exception:
-                    pass
 
             self.stats['files_indexed'] += indexed
             self.stats['files_deleted'] += deleted
             self.stats['errors'] += errors
             self.stats['batches_processed'] += 1
 
-            total = indexed + deleted
-            if total > 0:
-                parts = []
-                if indexed:
-                    parts.append(f"{indexed} indexed")
-                if deleted:
-                    parts.append(f"{deleted} deleted")
-                if skipped:
-                    parts.append(f"{skipped} skipped")
-                if errors:
-                    parts.append(f"{errors} errors")
-                _log(f"{short}/: Processed {len(batch)} changes: {', '.join(parts)}")
+            if indexed or deleted or errors:
+                parts = [f"{n} {label}" for n, label in
+                         ((indexed, "indexed"), (deleted, "deleted"), (skipped, "skipped"), (errors, "errors")) if n]
+                logger.info("%s/: processed %d changes: %s", self.short, len(batch), ", ".join(parts))
 
         except Exception as e:
-            _log(f"{short}/: Batch processing error: {e}")
+            logger.exception("%s/: batch processing error: %s", self.short, e)
             self.stats['errors'] += 1
         finally:
             self._processing = False
-            # If more changes accumulated during processing, trigger again
             if self._pending_changes:
                 self._reset_debounce()
 
@@ -515,8 +332,7 @@ _watchers: Dict[str, ProjectWatcher] = {}
 
 
 async def ensure_watcher(project_root: str, db_path: str) -> Optional[ProjectWatcher]:
-    """Ensure a watcher exists for the given project. Creates one if needed.
-    Returns None if watching is disabled."""
+    """Ensure a watcher exists for the given project. Returns None if watching is disabled."""
     if not _watcher_config['enabled']:
         return None
     if project_root in _watchers:
@@ -528,26 +344,27 @@ async def ensure_watcher(project_root: str, db_path: str) -> Optional[ProjectWat
         debounce_seconds=_watcher_config['debounce_seconds'],
         max_batch_size=_watcher_config['max_batch_size'],
         git_settle_seconds=_watcher_config['git_settle_seconds'],
+        reconcile_interval=_watcher_config['reconcile_interval'],
     )
-    await watcher.start()
     _watchers[project_root] = watcher
+    await watcher.start()
     return watcher
 
 
 async def stop_all_watchers():
-    """Stop all active watchers. Called during server shutdown."""
     for watcher in list(_watchers.values()):
         await watcher.stop()
     _watchers.clear()
 
 
 def get_watcher_status() -> Dict:
-    """Return status of all active watchers."""
-    return {
-        root: {
+    status = {}
+    for root, w in _watchers.items():
+        job = jobs.active_job(root)
+        status[root] = {
             'pending': len(w._pending_changes),
             'processing': w._processing,
             'stats': dict(w.stats),
+            'active_job': job.to_dict() if job else None,
         }
-        for root, w in _watchers.items()
-    }
+    return status

@@ -20,12 +20,39 @@ Usage:
 """
 
 import logging
+import re
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("fts-hybrid")
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+MAX_QUERY_TOKENS = 32
+
+
+def build_match_query(query: str) -> str:
+    """Turn free text into a safe FTS5 MATCH expression.
+
+    Raw user text is not valid FTS5 syntax: hyphens, dots, colons and the words
+    AND/OR/NOT are all operators, so "does not use the cache" or "config.yaml"
+    used to raise a syntax error and fall back to an exact phrase that rarely
+    matched. Each token is quoted and the tokens are OR-ed, so any chunk sharing
+    terms with the query is a candidate and bm25 ranks by rarity/frequency.
+    """
+    seen = set()
+    tokens = []
+    for tok in _TOKEN_RE.findall(query):
+        low = tok.lower()
+        if len(tok) < 2 or low in seen:
+            continue
+        seen.add(low)
+        tokens.append(tok)
+        if len(tokens) >= MAX_QUERY_TOKENS:
+            break
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 class FTSIndex:
@@ -205,16 +232,13 @@ class FTSIndex:
                db_path: Optional[str] = None) -> List[Dict]:
         """Full-text search with BM25 ranking.
 
-        Args:
-            query: Search text
-            n: Max results
-            filters: Dict of column -> value for exact-match filtering
-            db_path: Milvus DB path (used to derive FTS path)
-
-        Returns:
-            List of result dicts with content, doc_id, metadata columns, and distance=0.0
+        Returns result dicts with content, doc_id and the metadata columns.
+        Results carry no similarity score; the caller marks them as keyword hits.
         """
         if not db_path:
+            return []
+        match = build_match_query(query)
+        if not match:
             return []
 
         try:
@@ -223,8 +247,6 @@ class FTSIndex:
             logger.warning("FTS connection failed: %s", e)
             return []
 
-        safe_query = query.replace('"', '""')
-
         where_parts = []
         params: list = []
         if filters:
@@ -232,7 +254,6 @@ class FTSIndex:
                 if val is not None:
                     where_parts.append(f"{col} = ?")
                     params.append(val)
-
         where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
 
         sql = (
@@ -241,31 +262,37 @@ class FTSIndex:
             f"WHERE {self.table_name} MATCH ?{where_clause} "
             f"ORDER BY rank LIMIT ?"
         )
-        params_full = [safe_query] + params + [n]
-
         try:
-            rows = conn.execute(sql, params_full).fetchall()
+            rows = conn.execute(sql, [match] + params + [n]).fetchall()
         except Exception as e:
-            logger.debug("FTS5 MATCH failed (%s), trying quoted phrase", e)
-            params_full[0] = f'"{safe_query}"'
-            try:
-                rows = conn.execute(sql, params_full).fetchall()
-            except Exception as e2:
-                logger.warning("FTS5 search failed: %s", e2)
-                return []
+            logger.warning("FTS5 search failed for %r: %s", match, e)
+            rows = []
+        finally:
+            if not self._server_mode:
+                conn.close()
 
         all_cols = ["doc_id", "content"] + self.metadata_columns
-        results = []
-        for row in rows:
-            result = {"distance": 0.0}
-            for i, col in enumerate(all_cols):
-                result[col] = row[i]
-            results.append(result)
+        return [dict(zip(all_cols, row)) for row in rows]
 
-        if not self._server_mode:
-            conn.close()
+    def snapshot(self, db_path: str, path_column: str = "path") -> Dict[str, Set[str]]:
+        """{path: set(doc_id)} for the whole index. Used by verify/reconcile."""
+        if path_column not in self.metadata_columns:
+            raise ValueError(f"{path_column} is not a metadata column")
+        conn = self.connection(db_path)
+        try:
+            out: Dict[str, Set[str]] = {}
+            for doc_id, path in conn.execute(f"SELECT doc_id, {path_column} FROM {self.table_name}"):
+                out.setdefault(path, set()).add(doc_id)
+            return out
+        finally:
+            self.close_ephemeral(conn)
 
-        return results
+    def delete_doc_ids(self, conn: sqlite3.Connection, doc_ids: List[str]) -> None:
+        for i in range(0, len(doc_ids), 500):
+            batch = doc_ids[i:i + 500]
+            marks = ",".join("?" for _ in batch)
+            conn.execute(f"DELETE FROM {self.table_name} WHERE doc_id IN ({marks})", batch)
+        conn.commit()
 
     def clear(self, db_path: str):
         """Delete the FTS database file. Closes persistent connections first."""

@@ -152,12 +152,12 @@ tail -f ~/.code-rag/server.log
 
 ### Via CLI (Bulk Indexing)
 
-The CLI is best for initial indexing of large codebases. **The server must be stopped** because Milvus Lite uses exclusive SQLite locks.
+The CLI is best for initial indexing of large codebases. If the server is running, the CLI
+posts the job to it (`POST /index`) and shows progress while the server keeps serving searches;
+the server stays the only writer to the Milvus Lite files. With no server running the CLI
+indexes in-process.
 
 ```bash
-# Stop server first
-./code-rag-server.sh stop
-
 # Index (incremental by default — only changed files)
 ./index.sh /path/to/your/project
 
@@ -221,6 +221,35 @@ If `.ragignore` exists, it **replaces** the default exclusion list entirely. Lin
 
 When files are deleted or moved, their old index entries are automatically cleaned up during the next indexing run. The cleanup is scoped to the directory being indexed.
 
+### Background jobs, reconcile and verification
+
+`index_directory` (MCP) and `POST /index` return immediately with a job id. Poll with the
+`index_status` tool, `GET /jobs/<id>`, or `./code-rag-server.sh status`. One index or reconcile
+job runs per project at a time; a second request returns the running job.
+
+The index is kept consistent by a **reconcile** pass that compares the files on disk, the
+vector store and the keyword store, then removes deleted/excluded files, repairs keyword rows
+from the vector rows (no re-embedding), drops orphans, and indexes new or changed files. It runs
+when the watcher starts for a project, after `.git/HEAD` changes (checkout, rebase), after
+`.ragignore`/`.ragconfig` changes, and every `CODE_RAG_RECONCILE_INTERVAL` seconds (default 6h).
+Run it by hand with the `verify_index` tool: without arguments it reports drift; with
+`repair=true` it starts a reconcile job.
+
+### What gets indexed
+
+`indexing_rules.py` is the single predicate used by the CLI, the watcher and reconcile:
+configured extensions, inside the project root, no hidden path component (`.git/`, `.nuxt/`,
+`.claude/`...), not in an excluded directory, `.ragconfig` exclusions, no `.d.ts`, no `.js` with a
+`.ts` sibling, no minified/bundled files (by name, or js/ts/json with lines over 2000 chars), under
+1 MB, not JAXB-generated.
+
+### Search scores
+
+`Relevance` is cosine similarity between the query and the chunk (1.0 = identical). Hits found
+only by the keyword index show `Match: keyword` and no score; hits found by both show
+`Match: semantic+keyword`. `min_relevance` in `.ragconfig` drops semantic hits below that
+similarity (keyword hits always pass).
+
 ## Troubleshooting
 
 ### Server Won't Start
@@ -229,8 +258,8 @@ When files are deleted or moved, their old index entries are automatically clean
 # Check if already running
 ./code-rag-server.sh status
 
-# Check logs
-cat ~/.code-rag/server.log
+# Check logs (timestamped; rotated at 20 MB by the launcher)
+./code-rag-server.sh logs 100
 
 # Check if port is in use
 lsof -i :7101

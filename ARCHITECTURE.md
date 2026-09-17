@@ -60,7 +60,7 @@ Code-RAG is a semantic code search system that enables natural language queries 
 │   ├── Storage:    Milvus Lite (SQLite-backed)             │
 │   ├── Hybrid:     Vector (cosine) + FTS5 (BM25) via RRF  │
 │   ├── Indexing:   Incremental (SHA-256 hash tracking)     │
-│   └── Concurrency: Semaphore(1) + Lock() + lock-free reads│
+│   └── Concurrency: GPU lock + DB write lock + free reads │
 └────────────────────────┬──────────────────────────────────┘
                          │
 ┌────────────────────────▼──────────────────────────────────┐
@@ -111,7 +111,7 @@ Source File
 ┌──────────────────┐
 │ Embedding         │  Qwen3-Embedding-4B via MLX (Apple Silicon GPU)
 │                   │  Input: description + code → Output: 2560-dim float vector
-│                   │  ~460ms per chunk, serialized via Semaphore(1)
+│                   │  batched (8 chunks), serialized via the GPU lock  
 └────────┬─────────┘
          ▼
 ┌──────────────────┐
@@ -131,7 +131,7 @@ Natural Language Query (e.g., "JWT authentication logic")
 ┌──────────────────┐
 │ Query Embedding   │  Same Qwen3-Embedding-4B model, with task instruction prefix
 │                   │  Query → 2560-dim vector
-│                   │  Serialized via Semaphore(1)
+│                   │  Serialized via the GPU lock (one batch wait)
 └────────┬─────────┘
          │
     ┌────┴────────────────┐
@@ -301,7 +301,7 @@ Default description model (profile `high`): Gemma 4 E4B (`mlx-community/gemma-4-
 ~7.5 GB, Apache 2.0) via mlx-lm >= 0.31.2. Alternatives: Qwen3.6-35B-A3B (highest quality, ~22 GB),
 Gemma 4 E2B, Qwen3-4B-Instruct-2507, and the legacy Gemma 3 4B.
 
-The model is loaded once at server startup (~3-4 seconds) and shared across all projects. It runs entirely on the Apple Silicon GPU via MLX's Metal backend. Embedding generation is serialized via an `asyncio.Semaphore(1)` to prevent GPU memory contention.
+The model is loaded once at server startup and shared across all projects. It runs entirely on the Apple Silicon GPU via MLX's Metal backend. Every MLX call (embedding batches of `CODE_RAG_EMBED_BATCH` chunks, description generation) takes a process-wide re-entrant GPU lock, so concurrent threads never collide on the Metal command buffer and a search waits at most one batch. Chunks are truncated at `CODE_RAG_EMBED_MAX_TOKENS` (default 2048; the library default of 512 cut the body out of most contextualized chunks).
 
 GPU memory is periodically cleared (`mx.clear_cache()`) every 10 files during batch indexing and every 20 files during watcher-triggered reindexing to prevent memory pressure.
 
@@ -526,11 +526,31 @@ The primary transport is a persistent HTTP server built on Starlette/uvicorn:
 
 ### 8.2 Concurrency Model
 
+(Updated Sept 2026.) The asyncio loop only dispatches. Tool handlers run blocking work in
+worker threads via `asyncio.to_thread`; directory indexing and reconcile run as background
+jobs (`jobs.py`). Two process-wide locks coordinate the threads: the GPU lock around every MLX
+call and a write lock around every Milvus/FTS mutation. Reads are lock-free, use strong
+consistency, and retry on transient Milvus Lite errors, reopening the client on connection
+loss. The pre-2026-09 design held asyncio locks and ran several tool handlers synchronously on
+the loop, which blocked `/health` during long operations and got the server restarted by its
+own watchdog.
+
+### 8.2a Consistency
+
+Milvus (vectors) and the FTS5 sidecar (keywords) are two stores written back to back under the
+write lock; a crash between the two writes can leave them out of step, and FSEvents can drop
+events. `rag_milvus.reconcile()` compares disk, Milvus and FTS and repairs all three (keyword
+rows are rebuilt from Milvus rows without re-embedding). It runs at watcher start, after
+`.git/HEAD` changes, after config changes and periodically; `verify_index` reports the same
+comparison read-only.
+
+### 8.2b Concurrency Model (original notes)
+
 ```
 ┌──────────────────────────────────────────────────────┐
 │                  Concurrency Primitives               │
 │                                                       │
-│  asyncio.Semaphore(1)  ── Embedding serialization     │
+│  mlx_gpu.GPU (RLock)   ── MLX serialization           │
 │  │   Only one embedding operation at a time           │
 │  │   Prevents GPU memory contention                   │
 │  │                                                    │

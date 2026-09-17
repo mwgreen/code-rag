@@ -23,7 +23,9 @@ Claude Code ──HTTP/MCP──> code-rag server (persistent, port 7101)
 ```
 
 **Key design decisions:**
-- **Persistent HTTP server** — starts once, stays running across Claude Code sessions
+- **Persistent HTTP server** — starts once, stays running across Claude Code sessions; the only writer to each index
+- **Background jobs** — directory indexing and reconcile run as jobs (`index_status` to poll), so the server never blocks
+- **Self-healing index** — a reconcile pass (disk vs vector store vs keyword store) runs at watcher start, after git checkouts, on config changes and every 6 hours
 - **Per-project indexes** — each project stores its DB at `{project}/.code-rag/milvus.db`
 - **Shared model** — the MLX embedding model loads once, serves all projects
 - **Concurrent access** — multiple Claude Code sessions can search/index simultaneously
@@ -40,10 +42,9 @@ cd code-rag
 # 2. Start the persistent server
 ./code-rag-server.sh start
 
-# 3. Index your codebase (via CLI, server must be stopped)
-./code-rag-server.sh stop
+# 3. Index your codebase. With the server running, the CLI hands the job to it
+#    (no stop/start); with no server, it indexes locally.
 ./index.sh /path/to/your/project
-./code-rag-server.sh start
 
 # 4. Configure Claude Code (see USAGE.md for .mcp.json setup)
 ```
@@ -111,7 +112,8 @@ cd code-rag
 | File | Purpose |
 |------|---------|
 | `index_codebase.py` | CLI tool for batch indexing (progress bars, full/incremental) |
-| `index.sh` | Shell wrapper for index_codebase.py |
+| `index.sh` | Shell wrapper for index_codebase.py (delegates to a running server) |
+| `run-tests.sh` | Test suite (stdlib unittest, fake embedder, no GPU needed) |
 | `setup.sh` | Automated installation script |
 
 ### Configuration
@@ -121,6 +123,9 @@ cd code-rag
 | `package.json` | Node.js dependencies (code-chunk) |
 | `.ragignore` | Per-project directory exclusion list (placed in project root) |
 | `model_config.py` | Model registry, hardware profiles, and env-var resolution |
+| `indexing_rules.py` | The one place that decides which files are indexed (CLI, watcher and reconcile all use it) |
+| `jobs.py` | Background job registry for indexing/reconcile |
+| `logging_setup.py` | Timestamped logging to stderr (the launcher rotates `~/.code-rag/server.log`) |
 | `.env.example` | Documented model/profile environment variables |
 | `patches/` | MLX architecture patches for the legacy embedding models (Qwen2, CodexEmbed2B) |
 
@@ -136,12 +141,14 @@ cd code-rag
 
 ## Concurrency Model
 
-The HTTP server uses asyncio primitives for safe concurrent access:
-- **`asyncio.Semaphore(1)`** — serializes MLX embedding (single GPU thread)
-- **`asyncio.Lock()`** — serializes Milvus writes (SQLite-backed)
-- **Reads are lock-free** — multiple searches run in parallel
+All work runs in worker threads; the asyncio loop only dispatches, so `/health` always answers.
+- **GPU lock** (re-entrant) around every MLX call: embedding batches and description generation take turns, so a search waits at most one batch
+- **DB write lock** around every Milvus/FTS mutation, shared by the watcher, background jobs and tool calls
+- **Reads are lock-free** and retry on transient Milvus Lite errors (reopening the client on connection loss)
+- **One write job per project** at a time (index or reconcile); the watcher's per-file updates interleave safely
 
 Persistent Milvus clients are cached per `db_path` and reused across requests.
+Search scores are cosine **similarity** (1.0 = identical); keyword-only hits carry no score.
 
 ## License
 

@@ -1,3 +1,9 @@
+> **Status (Sept 2026):** every item below is implemented. Two details changed since this was
+> written: search scores are cosine *similarity* (1.0 = identical), so `min_relevance` drops hits
+> *below* that similarity, and the once-per-server `cleanup_stale_entries` was replaced by the
+> reconcile job (`rag_milvus.reconcile`, `verify_index` tool), which also repairs drift between
+> the vector and keyword stores.
+
 # Code-RAG Enhancement Spec
 
 These enhancements address real issues found during production use. All changes must preserve current default behavior — existing projects with no `.ragconfig` should work identically.

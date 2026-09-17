@@ -1,0 +1,269 @@
+"""Single source of truth for which files code-rag indexes.
+
+The CLI indexer, the file watcher, reconcile and the MCP tools all go through
+IndexRules so they can never disagree about what belongs in the index. Before
+this module existed the watcher had its own predicate that did not skip hidden
+directories, so .nuxt/, .output/, .github/ and .claude/ files leaked into indexes
+the CLI would never have created.
+
+Rules, in order:
+  1. extension must be in the configured list
+  2. path must be inside the project root
+  3. no hidden path component (dot-directories or dot-files)
+  4. no excluded directory name (.ragignore, or the defaults) in the path
+  5. .ragconfig exclude_extensions / exclude_patterns
+  6. .d.ts declaration files are skipped; .js/.jsx skipped when a .ts/.tsx sibling exists
+  7. minified/bundled files are skipped by name, and js/ts/json files with very long lines are skipped
+  8. files over MAX_FILE_BYTES are skipped
+  9. JAXB-generated Java is skipped (optional)
+"""
+
+import fnmatch
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Set
+
+import yaml
+
+logger = logging.getLogger("code-rag.rules")
+
+DEFAULT_EXTENSIONS: List[str] = [
+    '.java', '.js', '.ts', '.tsx', '.jsx', '.json', '.xml', '.yaml', '.yml', '.md',
+    '.gradle', '.properties', '.graphql', '.graphqls', '.proto',
+]
+
+MAX_FILE_BYTES = 1024 * 1024
+LONG_LINE_CHARS = 2000            # any line longer than this in the sniff window => minified/data blob
+LONG_LINE_SNIFF_BYTES = 16 * 1024
+LONG_LINE_MIN_FILE_BYTES = 20 * 1024
+LONG_LINE_SUFFIXES = {'.js', '.jsx', '.mjs', '.ts', '.tsx', '.json'}
+MINIFIED_NAME_RE = re.compile(r'(\.min\.[cm]?js$|\.min\.css$|\.bundle\.js$|-min\.js$)', re.IGNORECASE)
+
+CONFIG_FILES = ('.ragignore', '.ragconfig')
+
+DEFAULT_EXCLUDED_DIRS: Set[str] = {
+    'node_modules', 'build', 'dist', 'target', 'bin',
+    'test', 'tests', 'ext', 'bower_components',
+    '.sencha', 'locale', 'packages', 'sass',
+    'lib', 'libs', 'vendor', 'vendors',
+    'data', 'venv', 'cdk.out', 'generated',
+}
+
+_RAGCONFIG_DEFAULTS = {
+    'min_relevance': 0.0,
+    'exclude_extensions': [],
+    'exclude_patterns': [],
+    'type_overrides': [],
+    'read_file_max_bytes': 102400,
+}
+
+_ragconfig_cache: Dict[str, dict] = {}
+
+
+# --- .ragignore / .ragconfig ---
+
+def load_ragignore(project_root: Optional[str] = None) -> Optional[Set[str]]:
+    """Directory names listed in .ragignore. None if the file does not exist.
+
+    Note: a .ragignore REPLACES the default exclusion list rather than adding to it.
+    """
+    if project_root:
+        ragignore_path = Path(project_root) / '.ragignore'
+    else:
+        ragignore_path = Path(__file__).parent / '.ragignore'
+    if not ragignore_path.exists():
+        return None
+    excluded: Set[str] = set()
+    with open(ragignore_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                excluded.add(line)
+    return excluded
+
+
+def get_excluded_dirs(extra_excludes: Optional[List[str]] = None,
+                      project_root: Optional[str] = None) -> Set[str]:
+    """Excluded directory names: .ragignore if present, else defaults, plus extras."""
+    ragignore = load_ragignore(project_root)
+    excluded = set(ragignore) if ragignore is not None else set(DEFAULT_EXCLUDED_DIRS)
+    if extra_excludes:
+        excluded.update(extra_excludes)
+    return excluded
+
+
+def load_ragconfig(project_root: Optional[str] = None) -> dict:
+    """Load .ragconfig (YAML) from the project root, with defaults for missing keys. Cached."""
+    if not project_root:
+        return dict(_RAGCONFIG_DEFAULTS)
+    if project_root in _ragconfig_cache:
+        return _ragconfig_cache[project_root]
+
+    config_path = Path(project_root) / '.ragconfig'
+    result = dict(_RAGCONFIG_DEFAULTS)
+    if config_path.exists():
+        try:
+            with open(config_path, encoding='utf-8', errors='replace') as f:
+                config = yaml.safe_load(f) or {}
+            for key in _RAGCONFIG_DEFAULTS:
+                if key in config:
+                    result[key] = config[key]
+            logger.info("Loaded .ragconfig for %s", Path(project_root).name)
+        except Exception as e:
+            logger.warning("Failed to load .ragconfig at %s: %s", config_path, e)
+    _ragconfig_cache[project_root] = result
+    return result
+
+
+def invalidate_ragconfig(project_root: str) -> None:
+    _ragconfig_cache.pop(project_root, None)
+
+
+# --- Content sniffing ---
+
+def is_jaxb_generated(file_path: str) -> bool:
+    """Detect JAXB-generated Java by its header markers (first 50 lines)."""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = ''.join(f.readline() for _ in range(50))
+        if 'schema fragment specifies the expected content' in content:
+            return True
+        if 'generated by the JavaTM Architecture for XML Binding' in content:
+            return True
+        if '@XmlRootElement' in content and '@XmlType' in content:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def looks_minified(file_path: str, size: int) -> bool:
+    """Minified or bundled by name, or a js/ts/json file with a very long line.
+
+    Minified bundles chunk into hundreds of meaningless pieces (183 chunks for one
+    fontawesome-markers.min.js in a real index) and never help a search.
+    """
+    name = os.path.basename(file_path)
+    if MINIFIED_NAME_RE.search(name):
+        return True
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix in LONG_LINE_SUFFIXES and size >= LONG_LINE_MIN_FILE_BYTES:
+        try:
+            with open(file_path, 'rb') as f:
+                head = f.read(LONG_LINE_SNIFF_BYTES)
+        except OSError:
+            return False
+        longest = max((len(line) for line in head.split(b'\n')), default=0)
+        if longest > LONG_LINE_CHARS:
+            return True
+    return False
+
+
+# --- Rules ---
+
+class IndexRules:
+    """Decides which files under a project root are indexed. Cheap enough to run per FSEvent."""
+
+    def __init__(self, project_root: str, extensions: Optional[List[str]] = None,
+                 extra_excludes: Optional[List[str]] = None, jaxb_filter: bool = True):
+        self.root = os.path.realpath(project_root)
+        self.extensions: Set[str] = {e.lower() for e in (extensions or DEFAULT_EXTENSIONS)}
+        self.extra_excludes = list(extra_excludes or [])
+        self.jaxb_filter = jaxb_filter
+        self.excluded_dirs: Set[str] = set()
+        self.ragconfig: dict = {}
+        self.reload()
+
+    def reload(self) -> None:
+        """Re-read .ragignore / .ragconfig (called by the watcher when they change)."""
+        invalidate_ragconfig(self.root)
+        self.excluded_dirs = get_excluded_dirs(self.extra_excludes, project_root=self.root)
+        self.ragconfig = load_ragconfig(self.root)
+        self._exclude_ext = {e.lower() for e in self.ragconfig.get('exclude_extensions', [])}
+        self._exclude_patterns = list(self.ragconfig.get('exclude_patterns', []))
+
+    # -- special files --
+
+    def is_config_file(self, path: str) -> bool:
+        p = Path(path)
+        return p.name in CONFIG_FILES and os.path.realpath(str(p.parent)) == self.root
+
+    def is_git_ref_file(self, path: str) -> bool:
+        """`.git/HEAD`-style files whose change means a checkout/rebase happened."""
+        p = Path(path)
+        return p.parent.name == '.git' and p.name in ('HEAD', 'ORIG_HEAD', 'packed-refs', 'FETCH_HEAD')
+
+    # -- main predicate --
+
+    def relative(self, path: str) -> Optional[str]:
+        """Path relative to the root, or None if outside it."""
+        try:
+            rel = os.path.relpath(os.path.realpath(path), self.root)
+        except ValueError:
+            return None
+        if rel == '.' or rel.startswith('..'):
+            return None
+        return rel
+
+    def exclusion_reason(self, path: str, size: Optional[int] = None) -> Optional[str]:
+        """None if the file should be indexed, otherwise a short reason."""
+        name = os.path.basename(path)
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix not in self.extensions:
+            return 'extension'
+        rel = self.relative(path)
+        if rel is None:
+            return 'outside project root'
+        parts = rel.split(os.sep)
+        if any(part.startswith('.') for part in parts):
+            return 'hidden path component'
+        if self.excluded_dirs & set(parts[:-1]):
+            return 'excluded directory'
+        if suffix in self._exclude_ext:
+            return 'ragconfig exclude_extensions'
+        if self._exclude_patterns and any(fnmatch.fnmatch(rel, pat) for pat in self._exclude_patterns):
+            return 'ragconfig exclude_patterns'
+        if name.endswith('.d.ts'):
+            return 'declaration file'
+        if suffix in ('.js', '.jsx'):
+            stem = os.path.splitext(path)[0]
+            if os.path.exists(stem + '.ts') or os.path.exists(stem + '.tsx'):
+                return 'compiled from typescript sibling'
+        if size is None:
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                return 'missing'
+        if size > MAX_FILE_BYTES:
+            return 'too large'
+        if looks_minified(path, size):
+            return 'minified'
+        if self.jaxb_filter and suffix == '.java' and is_jaxb_generated(path):
+            return 'jaxb generated'
+        return None
+
+    def should_index(self, path: str, size: Optional[int] = None) -> bool:
+        return self.exclusion_reason(path, size) is None
+
+    # -- traversal --
+
+    def prune_dirs(self, dirnames: List[str]) -> List[str]:
+        return [d for d in dirnames if not d.startswith('.') and d not in self.excluded_dirs]
+
+    def walk(self, start: Optional[str] = None) -> Iterator[str]:
+        """Absolute paths of indexable files under `start` (default: project root), sorted."""
+        start = os.path.realpath(start or self.root)
+        for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
+            dirnames[:] = sorted(self.prune_dirs(dirnames))
+            for fname in sorted(filenames):
+                full = os.path.join(dirpath, fname)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                if not os.path.isfile(full):
+                    continue
+                if self.should_index(full, st.st_size):
+                    yield full
