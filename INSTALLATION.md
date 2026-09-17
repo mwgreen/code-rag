@@ -49,27 +49,36 @@ pip install -r requirements.txt
 
 Key dependencies: `pymilvus[milvus-lite]`, `mlx-embeddings`, `mlx`, `starlette`, `uvicorn`, `mcp`.
 
-**Important:** `transformers` must be version 4.x (not 5.x) for mlx-embeddings compatibility.
+**Important:** `transformers` must be 5.x. `mlx-embeddings>=0.1.0` and `mlx-lm>=0.31` both require it (older code-rag installs pinned `<5.0` for mlx-embeddings 0.0.x; upgrading the venv means upgrading transformers too).
 
-### 3. Qwen2 Architecture Patch
+### 3. Legacy Architecture Patches (optional)
 
-mlx-embeddings doesn't natively support Qwen2. Install the patch:
+The default Qwen3-Embedding models are supported natively by `mlx-embeddings>=0.1.0`. Only the
+legacy models need a patch copied into the package: Qodo-Embed (Qwen2) and SFR-Embedding-Code
+(CodexEmbed2B). `setup.sh` installs both; by hand:
 
 ```bash
 MLX_MODELS_DIR=$(python3 -c "import mlx_embeddings.models; import os; print(os.path.dirname(mlx_embeddings.models.__file__))")
 cp patches/mlx_embeddings_qwen2.py "$MLX_MODELS_DIR/qwen2.py"
+cp patches/mlx_embeddings_codexembed2b.py "$MLX_MODELS_DIR/codexembed2b.py"
 ```
 
-### 4. Embedding Model
+### 4. Models
 
-The model is Qodo-Embed-1-1.5B quantized to MLX Q8 (~1.6GB). It's too large for git and lives in the gitignored `models/` directory:
+Pick a hardware profile (default `high`, for a 48 GB machine; see [USAGE.md](USAGE.md#model-configuration)),
+then download both models. Embedding models are quantized to Q8 into the gitignored `models/` directory;
+the description model is cached in `~/.cache/huggingface/hub`.
 
 ```bash
-mkdir -p models/qodo-embed-1-1.5b-mlx-q8
-# Place model files here: model.safetensors, config.json, tokenizer.json, tokenizer_config.json
+export CODE_RAG_PROFILE=high       # or max | medium | low | legacy
+./download-embed-model.sh          # e.g. models/qwen3-embed-4b-mlx-q8 (~4.5 GB)
+./download-description-model.sh    # e.g. mlx-community/gemma-4-e4b-it-OptiQ-4bit (~7.5 GB)
+venv/bin/python model_config.py    # confirm what resolved
 ```
 
-Once placed, the system runs fully offline (`HF_HUB_OFFLINE=1` is auto-set).
+Both downloads are one-time and need network access; at runtime the server forces `HF_HUB_OFFLINE=1`.
+Moving from another machine: copying `models/` over works, but per-project indexes under
+`{project}/.code-rag/` must be rebuilt if the embedding model changed (`./index.sh --force`).
 
 ## Claude Code Configuration
 
@@ -165,7 +174,10 @@ code-rag/                           # Tool directory (lives in your dev env repo
 ├── requirements.txt                # Python deps
 ├── package.json                    # Node.js deps
 ├── patches/                        # MLX architecture patches
-├── models/                         # Embedding model (gitignored, ~1.6GB)
+├── model_config.py                 # Model registry + profiles
+├── download-embed-model.sh         # Download + Q8 quantize an embedding model
+├── download-description-model.sh   # Pre-cache a description model
+├── models/                         # Embedding models (gitignored)
 ├── venv/                           # Python venv (gitignored)
 ├── node_modules/                   # Node.js deps (gitignored)
 ├── README.md                       # Architecture overview
@@ -195,15 +207,23 @@ Falls back to tree-sitter, then regex chunking if code-chunk fails.
 ### Model Not Found
 
 ```bash
-ls models/qodo-embed-1-1.5b-mlx-q8/
-# Should contain: model.safetensors, config.json, tokenizer.json, tokenizer_config.json
+venv/bin/python model_config.py --list   # shows which models are downloaded and which resolved
+./download-embed-model.sh                # fetch the resolved embedding model
+./download-description-model.sh          # fetch the resolved description model
 ```
+
+If descriptions silently stop appearing, check `~/.code-rag/server.log` for "Failed to load description
+model": usually the model is not cached or `mlx-lm` is older than the model needs.
 
 ### transformers Version Error
 
+`mlx-embeddings>=0.1.0` and `mlx-lm>=0.31` need transformers 5.x. If an older venv still has the 4.x pin:
+
 ```bash
-pip install "transformers<5.0"
+venv/bin/pip install --upgrade "transformers[sentencepiece]>=5.0.0" "mlx-embeddings>=0.1.0" "mlx-lm>=0.31.3" "mlx>=0.32.2"
 ```
+
+(Only the `legacy` profile on an un-upgraded venv still works with transformers 4.x and mlx-embeddings 0.0.5.)
 
 ### Port Already in Use
 

@@ -21,6 +21,7 @@ from pymilvus import MilvusClient, DataType
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
 from mlx_gpu import GPU
+import model_config
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -36,13 +37,12 @@ from fts_hybrid import FTSIndex, rrf_merge
 logger = logging.getLogger("code-rag.milvus")
 
 # Embedding model configuration
-# Default: SFR-Embedding-Code-2B_R (Gemma 2, 2304 dims). Also supports:
-#   Qodo-Embed-1-1.5B (Qwen2, 1536 dims) via EMBED_MODEL_PATH env var.
-# Prefers local Q8 quantized model over full-precision HF model.
+# Resolved by model_config.py: EMBED_MODEL_PATH > CODE_RAG_EMBED_MODEL >
+# CODE_RAG_PROFILE > first downloaded model > default profile (Qwen3-Embedding-4B).
+# See model_config.EMBED_MODELS for the registry; `python model_config.py --list`
+# prints what this machine resolves to.
 _SCRIPT_DIR = Path(__file__).parent
-_LOCAL_Q8_MODEL = _SCRIPT_DIR / "models" / "sfr-embed-code-2b-mlx-q8"
-_DEFAULT_MODEL = str(_LOCAL_Q8_MODEL)
-_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", _DEFAULT_MODEL)
+_MODEL_PATH = model_config.resolve_embed_model_path()
 _EMBED_DIM = None  # Auto-detected from model config.json
 
 
@@ -115,7 +115,9 @@ def get_mlx_model():
     if not Path(_MODEL_PATH).exists():
         raise RuntimeError(
             f"Embedding model not found at {_MODEL_PATH}. "
-            f"Run ./setup.sh or ./download-model.sh to download it."
+            f"Run ./download-embed-model.sh (or ./setup.sh) to download it, "
+            f"or set CODE_RAG_PROFILE / CODE_RAG_EMBED_MODEL / EMBED_MODEL_PATH. "
+            f"See `python model_config.py --list`."
         )
 
     with GPU:
@@ -133,25 +135,17 @@ def get_mlx_model():
 
 
 # Query instruction prefix for models that require asymmetric encoding.
-# SFR-Embedding-Code requires this on queries; documents are encoded raw.
-# Qodo-Embed does not use instructions, so this is empty by default.
+# Qwen3-Embedding and SFR-Embedding-Code take an instruction on the query side;
+# documents are always encoded raw. Qodo-Embed is symmetric (empty prefix).
+# The prefix is keyed by model_type in config.json; see model_config.QUERY_INSTRUCTIONS.
 _QUERY_INSTRUCTION = None  # Auto-detected from model config
 
 
 def _get_query_instruction() -> str:
     """Get the query instruction prefix, detecting from model config if needed."""
     global _QUERY_INSTRUCTION
-    if _QUERY_INSTRUCTION is not None:
-        return _QUERY_INSTRUCTION
-    config_path = Path(_MODEL_PATH) / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-        # SFR/CodeXEmbed models use model_type "codexembed2b"
-        if config.get("model_type", "").startswith("codexembed"):
-            _QUERY_INSTRUCTION = "Instruct: Given Code or Text, retrieval relevant content\nQuery: "
-            return _QUERY_INSTRUCTION
-    _QUERY_INSTRUCTION = ""
+    if _QUERY_INSTRUCTION is None:
+        _QUERY_INSTRUCTION = model_config.query_instruction_for_model(_MODEL_PATH)
     return _QUERY_INSTRUCTION
 
 

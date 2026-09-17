@@ -23,7 +23,7 @@ fi
 
 # Check for Apple Silicon
 if [[ $(uname -m) != "arm64" ]]; then
-    echo "Error: This script requires Apple Silicon (M1/M2/M3/M4)"
+    echo "Error: This script requires Apple Silicon (M1 or later)"
     exit 1
 fi
 
@@ -42,6 +42,9 @@ if [[ $MACOS_VERSION -lt 15 ]]; then
     echo "  Warning: macOS 15+ recommended for optimal MLX performance (you have macOS $MACOS_VERSION)"
 else
     echo "  macOS $MACOS_VERSION"
+fi
+if [[ $MACOS_VERSION -lt 26 ]] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q 'M5'; then
+    echo "  Note: MLX uses the M5 GPU neural accelerators only on macOS 26.2+"
 fi
 
 echo ""
@@ -87,13 +90,13 @@ echo "  Installing Milvus Lite..."
 pip install --quiet "setuptools>=70.0,<82.0" "pymilvus[milvus-lite]"
 
 echo "  Installing MLX embeddings..."
-pip install --quiet mlx-embeddings mlx mlx-metal
+pip install --quiet "mlx>=0.32.2" mlx-metal "mlx-embeddings>=0.1.0"
 
 echo "  Installing MLX LM (NL descriptions)..."
-pip install --quiet mlx-lm
+pip install --quiet "mlx-lm>=0.31.3"
 
-echo "  Installing transformers <5.0 (required for compatibility)..."
-pip install --quiet "transformers<5.0"
+echo "  Installing transformers 5.x (required by mlx-embeddings>=0.1.0 and mlx-lm>=0.31)..."
+pip install --quiet "transformers[sentencepiece]>=5.0.0"
 
 echo "  Installing utilities..."
 pip install --quiet python-dotenv pyyaml
@@ -105,27 +108,28 @@ echo "  Installing watchdog (file watcher)..."
 pip install --quiet "watchdog>=4.0.0"
 
 echo "  Installing MCP (optional - for Claude Code integration)..."
-pip install --quiet mcp || echo "  MCP install failed (optional, can skip)"
+pip install --quiet "mcp>=1.0.0,<2.0" || echo "  MCP install failed (optional, can skip)"
 
 echo "  All dependencies installed"
 
-# Install architecture patches for mlx-embeddings
+# Install architecture patches for mlx-embeddings.
+# Only the legacy models (Qodo-Embed = qwen2, SFR-Embedding-Code = codexembed2b) need
+# these; Qwen3-Embedding is supported natively. Installed anyway so the legacy
+# profile keeps working. A file already shipped by the package is never overwritten.
 echo ""
-echo "Installing architecture patches for mlx-embeddings..."
+echo "Installing legacy architecture patches for mlx-embeddings..."
 MLX_MODELS_DIR=$(python3 -c "import mlx_embeddings.models; import os; print(os.path.dirname(mlx_embeddings.models.__file__))")
 if [ -n "$MLX_MODELS_DIR" ]; then
-    if [ -f "patches/mlx_embeddings_qwen2.py" ]; then
-        cp patches/mlx_embeddings_qwen2.py "$MLX_MODELS_DIR/qwen2.py"
-        echo "  Qwen2 architecture installed (for Qodo-Embed-1-1.5B)"
-    else
-        echo "  Warning: patches/mlx_embeddings_qwen2.py not found"
-    fi
-    if [ -f "patches/mlx_embeddings_codexembed2b.py" ]; then
-        cp patches/mlx_embeddings_codexembed2b.py "$MLX_MODELS_DIR/codexembed2b.py"
-        echo "  CodexEmbed2B architecture installed (for SFR-Embedding-Code-2B)"
-    else
-        echo "  Warning: patches/mlx_embeddings_codexembed2b.py not found"
-    fi
+    for patch in qwen2 codexembed2b; do
+        if [ ! -f "patches/mlx_embeddings_${patch}.py" ]; then
+            echo "  Warning: patches/mlx_embeddings_${patch}.py not found"
+        elif [ -f "$MLX_MODELS_DIR/${patch}.py" ] && ! cmp -s "patches/mlx_embeddings_${patch}.py" "$MLX_MODELS_DIR/${patch}.py"; then
+            echo "  mlx-embeddings already ships ${patch}.py; leaving it alone"
+        else
+            cp "patches/mlx_embeddings_${patch}.py" "$MLX_MODELS_DIR/${patch}.py"
+            echo "  ${patch} architecture installed (legacy models only)"
+        fi
+    done
 else
     echo "  Warning: Could not find mlx-embeddings models directory"
 fi
@@ -133,27 +137,15 @@ fi
 # Create data directory
 mkdir -p data
 
-# Download and quantize embedding model (default: SFR-Embedding-Code-2B)
+# Download models for the selected profile (CODE_RAG_PROFILE, default: high).
+# Set CODE_RAG_PROFILE=medium|low for smaller machines, or legacy for the old defaults.
 echo ""
-"$SCRIPT_DIR/download-sfr-embed.sh"
-
-# Pre-download NL description model (default: Gemma 3 4B; descriptions on by default)
+echo "Model profile: ${CODE_RAG_PROFILE:-high}   (change with CODE_RAG_PROFILE=max|high|medium|low|legacy)"
 echo ""
-echo "Pre-downloading NL description model (Gemma 3 4B)..."
-python3 << 'DESCEOF'
-from mlx_lm import load
+"$SCRIPT_DIR/download-embed-model.sh"
 
-# Default description model: Gemma 3 4B
-try:
-    print("  Downloading gemma-3-4b-it-4bit (~2.5 GB)...")
-    model, tokenizer = load("mlx-community/gemma-3-4b-it-4bit", tokenizer_config={"trust_remote_code": False})
-    print("  Gemma-3-4B cached for offline use")
-    del model, tokenizer
-except Exception as e:
-    print(f"  Gemma-3-4B download skipped: {e}")
-
-print("  (descriptions are on by default; disable with CODE_RAG_DESCRIPTIONS=0)")
-DESCEOF
+echo ""
+"$SCRIPT_DIR/download-description-model.sh" || echo "  Description model download failed; descriptions will be disabled until ./download-description-model.sh succeeds."
 
 # Test installation
 echo ""
@@ -175,7 +167,8 @@ except Exception as e:
 
 # Test embedding
 try:
-    print("  Testing Qodo-Embed-1-1.5B (Q8) embedding...")
+    import model_config
+    print(f"  Testing embedding with {model_config.summary()['embed_model_key']}...")
     model, tokenizer = rag_milvus.get_mlx_model()
     test_emb = rag_milvus.embed_texts(["test"])
     print(f"  Embedding works ({len(test_emb[0])} dimensions)")
@@ -223,8 +216,7 @@ echo "======================================================================"
 echo "Installation Complete!"
 echo "======================================================================"
 echo ""
-echo "Default embedding model: SFR-Embedding-Code-2B (Q8, 2304 dims, MLX)"
-echo "Default description model: Gemma 3 4B (MLX, on by default)"
+python3 model_config.py
 echo ""
 echo "Next steps:"
 echo ""
@@ -239,15 +231,15 @@ echo "   - Copy mcp-config-template.json contents to your .mcp.json"
 echo "   - Or merge into existing .mcp.json"
 echo "   - Restart Claude Code"
 echo ""
-echo "Optional: Alternative models"
+echo "Changing models (see .env.example):"
 echo ""
-echo "  Embedding (Qodo-Embed-1-1.5B, Qwen2, 1536 dims):"
-echo "    ./download-model.sh"
-echo "    export EMBED_MODEL_PATH=./models/qodo-embed-1-1.5b-mlx-q8"
+echo "  Whole profile:        export CODE_RAG_PROFILE=medium      # max|high|medium|low|legacy"
+echo "  Embedding only:       ./download-embed-model.sh qwen3-embed-0.6b"
+echo "                        export CODE_RAG_EMBED_MODEL=qwen3-embed-0.6b"
+echo "  Descriptions only:    ./download-description-model.sh qwen3-4b-2507"
+echo "                        export CODE_RAG_DESCRIPTION_MODEL_KEY=qwen3-4b-2507"
+echo "  List everything:      venv/bin/python model_config.py --list"
 echo ""
-echo "  NL descriptions (Qwen3 4B instead of Gemma 3 4B):"
-echo "    export CODE_RAG_DESCRIPTION_MODEL=Qwen/Qwen3-4B-MLX-4bit"
-echo ""
-echo "  Note: Switching embedding models requires re-indexing."
+echo "  Note: switching embedding models requires re-indexing (./index.sh --force)."
 echo ""
 echo "======================================================================"

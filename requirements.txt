@@ -1,19 +1,24 @@
 # Code-RAG dependencies for Apple Silicon Mac
-# Semantic code search with Qodo-Embed-1-1.5B + MLX + Milvus Lite
+# Semantic code search with Qwen3-Embedding (MLX) + Milvus Lite + Gemma 4 descriptions
+# Model choices live in model_config.py; see `python model_config.py --list`.
 
 # Vector database (embedded SQLite-based)
 pymilvus[milvus-lite]>=2.6.0,!=2.6.10  # 2.6.10 breaks unix socket address for milvus-lite
 setuptools>=70.0,<82.0  # provides pkg_resources needed by milvus-lite (removed in setuptools 82+)
 
 # MLX embeddings (Apple Silicon GPU)
-mlx>=0.30.0
-mlx-embeddings>=0.0.5
+# mlx>=0.32 uses the M5 GPU neural accelerators on macOS 26.2+ (3-4x faster prefill).
+# mlx-embeddings>=0.1.0 supports Qwen3-Embedding natively (no patch needed).
+mlx>=0.32.2
+mlx-embeddings>=0.1.0
 
 # MLX LM (local NL description generation for code chunks)
-mlx-lm>=0.20.0
+# 0.31.2 added Gemma 4; 0.30.7 added Qwen3.5; 0.31.3 needed for Qwen3.6.
+mlx-lm>=0.31.3
 
-# Transformers (MUST be <5.0 for mlx-embeddings compatibility)
-transformers>=4.40.0,<5.0
+# Transformers: mlx-embeddings>=0.1.0 and mlx-lm>=0.31 both require 5.x
+# (the old <5.0 pin only applied to mlx-embeddings 0.0.x / the legacy setup)
+transformers[sentencepiece]>=5.0.0
 
 # AST-based code chunking (tree-sitter)
 tree-sitter>=0.25.0

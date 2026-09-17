@@ -30,7 +30,7 @@ Code-RAG is a semantic code search system that enables natural language queries 
                                 │      │                │                     │
                                 │   ┌──▼──────────┐  ┌──▼──────────────────┐  │
                                 │   │ MLX Model   │  │ Milvus Lite (SQLite)│  │
-                                │   │ (Qodo-Embed)│  │ Per-project DB      │  │
+                                │   │ (Qwen3-Emb.)│  │ Per-project DB      │  │
                                 │   │ Apple GPU   │  │ .code-rag/milvus.db │  │
                                 │   └─────────────┘  └─────────────────────┘  │
                                 │                                             │
@@ -56,7 +56,7 @@ Code-RAG is a semantic code search system that enables natural language queries 
 ┌────────────────────────▼──────────────────────────────────┐
 │                     RAG Engine                             │
 │   rag_milvus.py                                           │
-│   ├── Embedding:  MLX + Qodo-Embed-1-1.5B (1536-dim)     │
+│   ├── Embedding:  MLX + Qwen3-Embedding-4B (2560-dim)   │
 │   ├── Storage:    Milvus Lite (SQLite-backed)             │
 │   ├── Hybrid:     Vector (cosine) + FTS5 (BM25) via RRF  │
 │   ├── Indexing:   Incremental (SHA-256 hash tracking)     │
@@ -109,8 +109,8 @@ Source File
 └────────┬─────────┘
          ▼
 ┌──────────────────┐
-│ Embedding         │  Qodo-Embed-1-1.5B via MLX (Apple Silicon GPU)
-│                   │  Input: text chunk → Output: 1536-dim float vector
+│ Embedding         │  Qwen3-Embedding-4B via MLX (Apple Silicon GPU)
+│                   │  Input: description + code → Output: 2560-dim float vector
 │                   │  ~460ms per chunk, serialized via Semaphore(1)
 └────────┬─────────┘
          ▼
@@ -129,8 +129,8 @@ Natural Language Query (e.g., "JWT authentication logic")
     │
     ▼
 ┌──────────────────┐
-│ Query Embedding   │  Same Qodo-Embed-1-1.5B model
-│                   │  Query → 1536-dim vector
+│ Query Embedding   │  Same Qwen3-Embedding-4B model, with task instruction prefix
+│                   │  Query → 2560-dim vector
 │                   │  Serialized via Semaphore(1)
 └────────┬─────────┘
          │
@@ -166,7 +166,8 @@ The single most important security property of Code-RAG is that **no source code
 | Component | Location | Network Access |
 |-----------|----------|----------------|
 | Source code (original files) | Local filesystem | None |
-| Embedding model (Qodo-Embed-1-1.5B Q8) | `code-rag/models/` (~1.6 GB) | None at runtime |
+| Embedding model (Qwen3-Embedding-4B Q8) | `code-rag/models/` (~4.5 GB) | None at runtime |
+| Description model (Gemma 4 E4B 4-bit) | `~/.cache/huggingface/hub/` (~7.5 GB) | None at runtime |
 | Embedding computation | Apple Silicon GPU via MLX | None |
 | Vector database (Milvus Lite) | `{project}/.code-rag/milvus.db` | None |
 | HTTP server | `127.0.0.1:7101` (localhost only) | Loopback only |
@@ -174,7 +175,7 @@ The single most important security property of Code-RAG is that **no source code
 | File watcher | macOS FSEvents (kernel-level) | None |
 
 **The only network access occurs during initial setup:**
-- `setup.sh` downloads the Qodo-Embed-1-1.5B model from HuggingFace (~5.8 GB, quantized to ~1.6 GB).
+- `setup.sh` downloads the embedding model for the selected profile from HuggingFace and quantizes it to Q8 (default Qwen3-Embedding-4B: ~8 GB download, ~4.5 GB quantized), and pre-caches the description model.
 - `npm install` downloads the `code-chunk` Node.js package.
 - After setup, the system auto-enables `HF_HUB_OFFLINE=1` to prevent any HuggingFace network calls.
 
@@ -233,7 +234,7 @@ The `index_file` MCP tool accepts an arbitrary file path and reads its contents 
 
 The embedding model is downloaded from HuggingFace during setup. The model files are:
 
-- **Source:** `Qodo/Qodo-Embed-1-1.5B` on HuggingFace Hub
+- **Source:** `Qwen/Qwen3-Embedding-4B` on HuggingFace Hub by default (other registry entries in `model_config.py`)
 - **License:** Apache 2.0
 - **Format:** SafeTensors (a safe serialization format that prevents arbitrary code execution, unlike pickle)
 - **Quantized locally** to Q8 via `mlx_embeddings.utils.convert`
@@ -251,7 +252,7 @@ SafeTensors is specifically designed to be a safe format for model weights -- it
 | File Watching | watchdog | Established Python library, uses macOS FSEvents |
 | Protocol | mcp | Anthropic's Model Context Protocol SDK |
 
-All dependencies are open-source with permissive licenses. The `patches/mlx_embeddings_qwen2.py` file is a custom Qwen2 architecture implementation that is copied into the mlx-embeddings package directory during setup.
+All dependencies are open-source with permissive licenses. The files under `patches/` are custom Qwen2 and CodexEmbed2B architecture implementations copied into the mlx-embeddings package during setup; they are only used by the legacy embedding models.
 
 ### 4.8 Summary of Potential Concerns
 
@@ -267,27 +268,46 @@ All dependencies are open-source with permissive licenses. The `patches/mlx_embe
 
 ## 5. Embedding Model
 
-### 5.1 Current Model: Qodo-Embed-1-1.5B
+### 5.1 Model Registry and Profiles
+
+Models are declared in `model_config.py` and selected per machine by `CODE_RAG_PROFILE`
+(`max | high | medium | low | legacy`), by registry key, or by direct path/HF id. With nothing
+configured, the best already-downloaded model is used. See USAGE.md, "Model Configuration".
+
+Default embedding model (profile `high`):
 
 | Property | Value |
 |----------|-------|
-| Model | Qodo-Embed-1-1.5B |
-| Architecture | Qwen2 (transformer-based encoder) |
-| Embedding Dimensions | 1536 |
-| Full Precision Size | ~5.8 GB |
-| Quantized Size (Q8) | ~1.6 GB |
+| Model | Qwen3-Embedding-4B |
+| Architecture | Qwen3 decoder, last-token pooling (native in mlx-embeddings >= 0.1.0) |
+| Embedding Dimensions | 2560 (Matryoshka-capable; full width used) |
+| Full Precision Size | ~8 GB |
+| Quantized Size (Q8) | ~4.5 GB |
 | Quantization | 8-bit, group_size=64 |
+| Query instruction | `Instruct: Given a natural language question about a codebase, retrieve relevant code snippets and documentation\nQuery:` |
 | Framework | MLX (Apple Silicon Metal GPU) |
 | License | Apache 2.0 |
-| Specialization | Code and text embedding |
+| Specialization | General-purpose text + code; top open model on 2026 code-retrieval benchmarks |
+
+Other registry entries: Qwen3-Embedding-0.6B (1024 dims, ~10x faster), SFR-Embedding-Code-2B_R
+(2304 dims, CC-BY-NC, legacy default), Qodo-Embed-1-1.5B (1536 dims, legacy).
+
+The query instruction is chosen from `model_type` in the model's `config.json`
+(`qwen3`, `codexembed2b`); documents are always embedded raw. The embedding dimension is read
+from `hidden_size`, and `model_config.json` next to each index records which model built it so
+a mismatch fails loudly instead of returning garbage.
+
+Default description model (profile `high`): Gemma 4 E4B (`mlx-community/gemma-4-e4b-it-OptiQ-4bit`,
+~7.5 GB, Apache 2.0) via mlx-lm >= 0.31.2. Alternatives: Qwen3.6-35B-A3B (highest quality, ~22 GB),
+Gemma 4 E2B, Qwen3-4B-Instruct-2507, and the legacy Gemma 3 4B.
 
 The model is loaded once at server startup (~3-4 seconds) and shared across all projects. It runs entirely on the Apple Silicon GPU via MLX's Metal backend. Embedding generation is serialized via an `asyncio.Semaphore(1)` to prevent GPU memory contention.
 
 GPU memory is periodically cleared (`mx.clear_cache()`) every 10 files during batch indexing and every 20 files during watcher-triggered reindexing to prevent memory pressure.
 
-### 5.2 Architecture Patch
+### 5.2 Architecture Patches (legacy models only)
 
-The Qwen2 architecture is not natively supported by `mlx-embeddings`. Code-RAG includes a custom implementation at `patches/mlx_embeddings_qwen2.py` that is installed into the mlx-embeddings package during setup. Key differences from Qwen3:
+Qwen3-Embedding needs no patch. The legacy models do: `patches/mlx_embeddings_qwen2.py` (Qodo-Embed) and `patches/mlx_embeddings_codexembed2b.py` (SFR-Embedding-Code, Gemma 2 base) are installed into the mlx-embeddings package during setup. Key differences of Qwen2 from Qwen3:
 
 - Attention has bias on Q/K/V projections (not O projection)
 - No QK normalization
@@ -321,7 +341,7 @@ The current implementation uses a fully local embedding model. This could be rep
 
 #### Trade-offs
 
-| Factor | Local (Qodo-Embed) | Cloud (OpenAI/Voyage) |
+| Factor | Local (Qwen3-Embedding) | Cloud (OpenAI/Voyage) |
 |--------|--------------------|-----------------------|
 | **Privacy** | Code never leaves machine | Code sent to external API |
 | **Cost** | Free (after model download) | Per-token pricing |
@@ -329,9 +349,9 @@ The current implementation uses a fully local embedding model. This could be rep
 | **Platform** | Apple Silicon only | Any platform |
 | **Offline** | Fully offline capable | Requires internet |
 | **Quality** | State-of-the-art code embeddings | Comparable or better |
-| **Setup** | ~1.6 GB model download | API key only |
+| **Setup** | 0.7-4.5 GB model download | API key only |
 
-**Recommendation:** The local Qodo-Embed model is the correct default for privacy-sensitive codebases (proprietary code, enterprise environments). Cloud providers are a viable option for open-source projects or environments where code sharing is acceptable, and would make the system cross-platform.
+**Recommendation:** The local Qwen3-Embedding model is the correct default for privacy-sensitive codebases (proprietary code, enterprise environments). Cloud providers are a viable option for open-source projects or environments where code sharing is acceptable, and would make the system cross-platform.
 
 To support provider switching, the embedding layer could be abstracted behind an interface:
 
@@ -370,7 +390,7 @@ Milvus Lite is an embedded vector database that requires no separate server proc
 | Field | Type | Purpose |
 |-------|------|---------|
 | `id` | uint64 | Hash of doc_id |
-| `vector` | FloatVector[1536] | Embedding vector |
+| `vector` | FloatVector[dim] | Embedding vector (dim from model: 2560 default) |
 | `document` | String | Code chunk text |
 | `doc_id` | String | `{filepath}::{chunk_index}` |
 | `path` | String | Absolute file path |
@@ -648,7 +668,12 @@ All tools require the `X-Project-Root` header. Missing header returns an error w
 | `CODE_RAG_WATCH_MAX_BATCH` | `100` | Max files per watcher batch |
 | `CODE_RAG_WATCH_GIT_SETTLE` | `3.0` | Wait after git operations (seconds) |
 | `CODE_RAG_PROJECT_ROOT` | `$CWD` | Project root (stdio mode only) |
-| `EMBED_MODEL_PATH` | `./models/qodo-embed-1-1.5b-mlx-q8` | Path to embedding model |
+| `CODE_RAG_PROFILE` | auto (`high` on a fresh machine) | Model profile: `max`, `high`, `medium`, `low`, `legacy` |
+| `CODE_RAG_EMBED_MODEL` | from profile | Embedding model registry key (e.g. `qwen3-embed-0.6b`) |
+| `EMBED_MODEL_PATH` | from registry | Direct path to an MLX embedding model (overrides everything) |
+| `CODE_RAG_DESCRIPTION_MODEL_KEY` | from profile | Description model registry key (e.g. `gemma-4-e4b`) |
+| `CODE_RAG_DESCRIPTION_MODEL` | from registry | Direct mlx-lm HF id (overrides everything) |
+| `CODE_RAG_DESCRIPTIONS` | `1` | Set `0` to disable NL descriptions |
 | `HF_HUB_OFFLINE` | Auto-set to `1` if model cached | Prevents HuggingFace network calls |
 | `MAX_CHUNK_SIZE` | `2000` | Maximum chunk size (characters) |
 | `MIN_CHUNK_SIZE` | `100` | Minimum chunk size (characters) |
@@ -692,7 +717,10 @@ All dependencies are open source with permissive licenses:
 |-----------|---------|------------|
 | MLX | Apache 2.0 | Apple |
 | Milvus / Milvus Lite | Apache 2.0 | Linux Foundation / Zilliz |
-| Qodo-Embed-1-1.5B | Apache 2.0 | Qodo |
+| Qwen3-Embedding | Apache 2.0 | Alibaba (Qwen) |
+| Gemma 4 | Apache 2.0 | Google DeepMind |
+| SFR-Embedding-Code-2B_R (legacy) | CC-BY-NC-4.0 | Salesforce |
+| Qodo-Embed-1-1.5B (legacy) | OpenRAIL++-M | Qodo |
 | code-chunk | MIT | supermemory |
 | transformers | Apache 2.0 | Hugging Face |
 | tree-sitter | MIT | tree-sitter |
@@ -721,7 +749,7 @@ All dependencies are open source with permissive licenses:
 ### Pluggable Embedding Providers
 
 Abstracting the embedding layer behind a provider interface would allow switching between:
-- **Local (default):** Qodo-Embed via MLX (current, nothing leaves machine)
+- **Local (default):** Qwen3-Embedding via MLX (current, nothing leaves machine)
 - **OpenAI:** `text-embedding-3-large` (cross-platform, requires API key, code sent to OpenAI)
 - **Voyage AI:** `voyage-code-3` (code-specialized, requires API key, code sent to Voyage)
 - **Ollama:** Local embedding models via Ollama (cross-platform, nothing leaves machine, but slower than MLX)

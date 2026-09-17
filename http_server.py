@@ -30,6 +30,8 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import rag_milvus
 import file_watcher
+import model_config
+import nl_descriptions
 from tools import register_tools, set_current_project_root
 
 logger = logging.getLogger("code-rag")
@@ -98,6 +100,8 @@ async def health(request: Request) -> JSONResponse:
         "model": _model_loaded,
         "embed_model": Path(rag_milvus._MODEL_PATH).name if _model_loaded else None,
         "embed_dim": rag_milvus._EMBED_DIM,
+        "description_model": nl_descriptions.MODEL_ID if nl_descriptions.is_enabled() else None,
+        "model_profile": model_config.summary()["profile"],
         "milvus": _server_mode_ready,
         "watchers": watchers,
     })

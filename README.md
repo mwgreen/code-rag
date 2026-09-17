@@ -1,6 +1,6 @@
 # Code-RAG: Semantic Code Search for Apple Silicon
 
-Semantic code search using Qodo-Embed-1-1.5B embeddings with MLX (Apple Silicon GPU) and Milvus Lite vector database.
+Semantic code search using local MLX embeddings (default: Qwen3-Embedding-4B) on the Apple Silicon GPU, Milvus Lite as the vector database, and a local LLM (default: Gemma 4 E4B) that writes one-sentence descriptions of each code chunk. Models are selectable by hardware profile; see [Model Configuration](USAGE.md#model-configuration).
 
 ## What Is This?
 
@@ -25,7 +25,7 @@ Claude Code ──HTTP/MCP──> code-rag server (persistent, port 7101)
 **Key design decisions:**
 - **Persistent HTTP server** — starts once, stays running across Claude Code sessions
 - **Per-project indexes** — each project stores its DB at `{project}/.code-rag/milvus.db`
-- **Shared model** — the 1.6GB MLX embedding model loads once, serves all projects
+- **Shared model** — the MLX embedding model loads once, serves all projects
 - **Concurrent access** — multiple Claude Code sessions can search/index simultaneously
 - **Project identification** — `X-Project-Root` HTTP header tells the server which project's DB to use
 
@@ -67,16 +67,22 @@ cd code-rag
    - Each chunk includes scope chain, imports, and method signatures
    - Falls back to tree-sitter, then regex for unsupported files
 
-2. **Embedding**: Converts chunks to 1536-dim vectors using Qodo-Embed-1-1.5B
-   - Q8 quantized (~1.6GB) running on Apple Silicon GPU via MLX
+2. **Description** (optional, on by default): A local LLM writes a one-sentence summary of each
+   code chunk, which is prepended to the code before embedding to bridge the NL-to-code vocabulary gap
+   - Default: Gemma 4 E4B (`mlx-community/gemma-4-e4b-it-OptiQ-4bit`) via mlx-lm
+   - Cached in SQLite by content hash, so each chunk is described once
+
+3. **Embedding**: Converts chunks (description + code) to vectors with an MLX embedding model
+   - Default: Qwen3-Embedding-4B, Q8 quantized (~4.5GB, 2560 dims); smaller/legacy models selectable
+   - Queries get a task instruction prefix; documents are embedded raw
    - Runs fully offline after model setup
 
-3. **Indexing**: Stores vectors in Milvus Lite (embedded SQLite-based DB)
+4. **Indexing**: Stores vectors in Milvus Lite (embedded SQLite-based DB)
    - Incremental updates (only changed files via hash detection)
    - Automatic cleanup of deleted/moved files
    - Per-project DB files at `{project}/.code-rag/milvus.db`
 
-4. **Search**: Vector similarity search with cosine distance
+5. **Search**: Vector similarity search with cosine distance
    - Natural language queries via MCP tools
    - Filter by language or type
    - Sub-second results
@@ -114,7 +120,9 @@ cd code-rag
 | `requirements.txt` | Python dependencies |
 | `package.json` | Node.js dependencies (code-chunk) |
 | `.ragignore` | Per-project directory exclusion list (placed in project root) |
-| `patches/` | MLX architecture patches (Qwen2 support) |
+| `model_config.py` | Model registry, hardware profiles, and env-var resolution |
+| `.env.example` | Documented model/profile environment variables |
+| `patches/` | MLX architecture patches for the legacy embedding models (Qwen2, CodexEmbed2B) |
 
 ### Runtime Locations
 | Path | Purpose |
@@ -122,7 +130,8 @@ cd code-rag
 | `~/.code-rag/server.pid` | Server PID file (global, one server process) |
 | `~/.code-rag/server.log` | Server log file |
 | `{project}/.code-rag/milvus.db` | Project's vector index (per-project) |
-| `code-rag/models/` | MLX embedding model (gitignored, ~1.6GB) |
+| `code-rag/models/` | MLX embedding models (gitignored, 0.7-4.5GB each) |
+| `~/.cache/huggingface/hub/` | Description model cache (pre-downloaded by `download-description-model.sh`) |
 | `code-rag/venv/` | Python virtual environment |
 
 ## Concurrency Model
@@ -139,6 +148,8 @@ Persistent Milvus clients are cached per `db_path` and reused across requests.
 All dependencies are open source:
 - **MLX**: Apache 2.0 (Apple)
 - **Milvus**: Apache 2.0 (Linux Foundation)
-- **Qodo-Embed**: Apache 2.0 (Qodo)
+- **Qwen3-Embedding**: Apache 2.0 (Alibaba)
+- **Gemma 4**: Apache 2.0 (Google)
+- Legacy models: SFR-Embedding-Code-2B_R is CC-BY-NC-4.0, Qodo-Embed is OpenRAIL++-M, Gemma 3 is under the Gemma terms
 - **code-chunk**: MIT (supermemory)
 - **transformers**: Apache 2.0 (Hugging Face)

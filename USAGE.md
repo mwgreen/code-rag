@@ -66,6 +66,62 @@ Just ask Claude Code naturally — it will use the tools automatically:
 - "Index the new feature I added in src/features/payment"
 - "How many files are indexed?"
 
+## Model Configuration
+
+Two local models are used: an **embedding model** (vectors for chunks and queries) and a
+**description model** (an LLM that writes a one-sentence summary of each chunk before it is embedded).
+Both are chosen by `model_config.py`. Run `venv/bin/python model_config.py --list` to see every
+option and what your machine currently resolves to.
+
+### Profiles
+
+Pick a profile for your hardware with `CODE_RAG_PROFILE`:
+
+| Profile | RAM | Embedding model | Description model | Notes |
+|---------|-----|-----------------|-------------------|-------|
+| `max` | 64 GB+ | Qwen3-Embedding-4B (2560 dims) | Qwen3.6-35B-A3B (~22 GB) | Best descriptions; ~29 GB peak while indexing |
+| `high` | 48 GB | Qwen3-Embedding-4B (2560 dims) | Gemma 4 E4B (~7.5 GB) | **Default.** ~12 GB peak while indexing, ~5 GB serving |
+| `medium` | 24-32 GB | Qwen3-Embedding-0.6B (1024 dims) | Gemma 4 E4B | Fast indexing, smaller indexes |
+| `low` | 16 GB | Qwen3-Embedding-0.6B (1024 dims) | Gemma 4 E2B (~4 GB) | Smallest footprint with descriptions on |
+| `legacy` | 32 GB | SFR-Embedding-Code-2B (2304 dims) | Gemma 3 4B | Pre-Sept-2026 defaults; needs the mlx-embeddings patches |
+
+```bash
+export CODE_RAG_PROFILE=medium
+./download-embed-model.sh          # fetches the profile's embedding model, quantizes to Q8
+./download-description-model.sh    # caches the profile's description model for offline use
+./index.sh --force /path/to/project   # embedding model changed -> full re-index
+```
+
+### Resolution order
+
+For each model, the first of these that is set wins:
+
+1. Direct override: `EMBED_MODEL_PATH` (a local MLX model dir) / `CODE_RAG_DESCRIPTION_MODEL` (any mlx-lm HF id)
+2. Registry key: `CODE_RAG_EMBED_MODEL` / `CODE_RAG_DESCRIPTION_MODEL_KEY` (keys from `model_config.py --list`)
+3. Profile: `CODE_RAG_PROFILE`
+4. Auto-detect: the best model that is already downloaded on this machine
+5. The `high` profile
+
+Step 4 means an existing machine keeps using whatever it has after a code update, and a fresh machine
+picks up the new defaults once the download scripts have run. Put these in `code-rag/.env` (see
+`.env.example`) or export them before starting the server. `curl localhost:7101/health` shows the
+resolved `embed_model`, `description_model` and `model_profile`.
+
+### Mixing and matching
+
+```bash
+./download-embed-model.sh qwen3-embed-0.6b
+export CODE_RAG_EMBED_MODEL=qwen3-embed-0.6b            # switching embedders requires re-indexing
+
+./download-description-model.sh qwen3.6-35b-a3b
+export CODE_RAG_DESCRIPTION_MODEL_KEY=qwen3.6-35b-a3b   # cached descriptions stay valid
+
+export CODE_RAG_DESCRIPTIONS=0                          # descriptions off: faster indexing
+```
+
+Requirements: `mlx-embeddings>=0.1.0` (native Qwen3-Embedding support), `mlx-lm>=0.31.3` (Gemma 4, Qwen3.5/3.6).
+On an M5 Mac, MLX uses the GPU neural accelerators (3-4x faster prompt processing) on macOS 26.2 or later.
+
 ## Server Management
 
 ### Starting and Stopping

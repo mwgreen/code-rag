@@ -1,13 +1,16 @@
 """
 LLM-generated natural language descriptions for code chunks.
 
-Uses a local MLX LLM (default: gemma-3-4b-it-4bit, configurable via
-CODE_RAG_DESCRIPTION_MODEL env var) to generate one-sentence summaries of
-code chunks, improving semantic search by bridging the vocabulary gap between
-natural language queries and code.
+Uses a local MLX LLM to generate one-sentence summaries of code chunks,
+improving semantic search by bridging the vocabulary gap between natural
+language queries and code.
+
+The model is resolved by model_config.py (default profile: Gemma 4 E4B via
+mlx-community/gemma-4-e4b-it-OptiQ-4bit). Override with CODE_RAG_DESCRIPTION_MODEL
+(any HF id), CODE_RAG_DESCRIPTION_MODEL_KEY (registry key) or CODE_RAG_PROFILE.
 
 Descriptions are cached in SQLite keyed by SHA256 of chunk content.
-Enabled via CODE_RAG_DESCRIPTIONS=1 environment variable (off by default).
+On by default; disable with CODE_RAG_DESCRIPTIONS=0.
 """
 
 import hashlib
@@ -19,6 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from mlx_gpu import GPU
+import model_config
 
 # Block HuggingFace network access (also set by rag_milvus on import)
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
@@ -28,7 +32,7 @@ logger = logging.getLogger("code-rag.descriptions")
 
 # --- Configuration ---
 
-MODEL_ID = os.getenv("CODE_RAG_DESCRIPTION_MODEL", "mlx-community/gemma-3-4b-it-4bit")
+MODEL_ID = model_config.resolve_description_model_id()
 MAX_GEN_TOKENS = 100
 MAX_INPUT_CHARS = 2000
 MIN_CHUNK_CHARS = 100  # Skip tiny chunks (imports-only, trivial)
@@ -68,7 +72,7 @@ def is_enabled(db_path: str | None = None) -> bool:
 
 
 def load_model():
-    """Load the description model (default: gemma-3-4b-it-4bit).
+    """Load the description model (see model_config.py for resolution).
 
     On failure, sets a process-level sticky flag so describe_chunks() short-circuits
     on subsequent calls instead of retrying the load for every chunk.
@@ -95,7 +99,8 @@ def load_model():
             _model_load_failed = True
             logger.warning(
                 "Failed to load description model %s: %s. Disabling NL descriptions for this process. "
-                "Set CODE_RAG_DESCRIPTIONS=0 to silence this, or pre-download the model.",
+                "Set CODE_RAG_DESCRIPTIONS=0 to silence this, or pre-download the model with "
+                "./download-description-model.sh (and check mlx-lm meets the model's minimum version).",
                 MODEL_ID, e
             )
             raise
