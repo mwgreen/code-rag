@@ -89,7 +89,7 @@ Pick a profile for your hardware with `CODE_RAG_PROFILE`:
 export CODE_RAG_PROFILE=medium
 ./download-embed-model.sh          # fetches the profile's embedding model, quantizes to Q8
 ./download-description-model.sh    # caches the profile's description model for offline use
-./index.sh --force /path/to/project   # embedding model changed -> full re-index
+./index.sh /path/to/project --clear   # embedding model changed -> drop the index and rebuild (description cache is kept)
 ```
 
 ### Resolution order
@@ -181,7 +181,8 @@ python3 index_codebase.py --path /path/to/code [OPTIONS]
 
 Options:
   --full              Full re-index (ignore file hashes, re-embed everything)
-  --clear             Clear existing index before indexing
+  --clear             Drop the existing index first, then rebuild (keeps the description cache;
+                      works even if the index was built by a different embedding model)
   --extensions        Comma-separated extensions (e.g., .java,.js,.ts)
   --exclude-dirs      Extra directories to exclude (merged with .ragignore)
   --no-jaxb-filter    Disable JAXB-generated Java file detection

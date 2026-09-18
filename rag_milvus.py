@@ -354,7 +354,7 @@ def _check_model_consistency(db_path: str) -> None:
             f"Embedding dimension mismatch: index was built with {stored_dim}-dim embeddings "
             f"(model: {stored.get('embed_model_path', 'unknown')}), but the current model produces "
             f"{current_dim}-dim embeddings (model: {_MODEL_PATH}). "
-            f"Re-index with: ./index.sh /path/to/project --full --clear"
+            f"Re-index with: ./index.sh {Path(db_path).parent.parent} --clear"
         )
     if stored.get("embed_model_path") != _MODEL_PATH:
         _write_model_config(meta_path)
@@ -378,8 +378,13 @@ def _is_connection_error(exc: BaseException) -> bool:
     return any(m in msg for m in _CONNECTION_MARKERS)
 
 
-def _with_client(db_path: Optional[str], fn: Callable[[MilvusClient], object], retries: int = 2):
+def _with_client(db_path: Optional[str], fn: Callable[[MilvusClient], object], retries: int = 2,
+                 prepare: bool = True):
     """Run fn(client) against the right client for the current mode.
+
+    prepare=False skips _prepare (collection load + embedding-model consistency
+    check). Only clear_collection uses it, so an index built by a different
+    embedding model can still be dropped.
 
     Server mode: persistent client, transient errors retried (reopening the
     client on connection errors). CLI batch session: the session client.
@@ -392,7 +397,8 @@ def _with_client(db_path: Optional[str], fn: Callable[[MilvusClient], object], r
         while True:
             client = _persistent_client(path)
             try:
-                _prepare(client, path)
+                if prepare:
+                    _prepare(client, path)
                 return fn(client)
             except MilvusException as e:
                 if attempt >= retries or not _is_transient(e):
@@ -405,12 +411,14 @@ def _with_client(db_path: Optional[str], fn: Callable[[MilvusClient], object], r
                 time.sleep(0.5 * attempt)
 
     if _active_client is not None:
-        _prepare(_active_client, path)
+        if prepare:
+            _prepare(_active_client, path)
         return fn(_active_client)
 
     client = _open_client(path)
     try:
-        _prepare(client, path)
+        if prepare:
+            _prepare(client, path)
         return fn(client)
     finally:
         try:
@@ -429,7 +437,8 @@ def milvus_session(db_path: Optional[str] = None):
         yield
         return
     client = _open_client(path)
-    _prepare(client, path)
+    # No eager _prepare: _with_client prepares on first use, and clear_collection
+    # (prepare=False) must be able to drop a dimension-mismatched index first.
     _active_client = client
     try:
         yield
@@ -795,16 +804,24 @@ def add_file(path: str, force: bool = False, db_path: Optional[str] = None) -> i
 
 
 def clear_collection(db_path: Optional[str] = None):
-    """Drop all data (Milvus + FTS) for a project."""
+    """Drop all data (Milvus + FTS) for a project.
+
+    Skips the embedding-model consistency check so an index built by a different
+    model (dimension mismatch) can still be cleared: this is the recovery path
+    for switching embedders. The description cache (descriptions.db) is keyed by
+    chunk content, not by embedder, and is kept so the rebuild reuses it."""
     path = _resolve_db_path(db_path)
     with _DB_LOCK:
         def run(client: MilvusClient):
             if client.has_collection(COLLECTION_NAME):
                 client.drop_collection(COLLECTION_NAME)
                 logger.info("Collection cleared: %s", path)
-        _with_client(path, run)
+        _with_client(path, run, prepare=False)
         _prepared_dbs.discard(path)
         _fts.clear(path)
+        meta_path = Path(path).parent / "model_config.json"
+        if meta_path.exists():
+            meta_path.unlink()  # the next _prepare records the current model
 
 
 def _rebuild_fts_for_path(abs_path: str, db_path: str) -> int:

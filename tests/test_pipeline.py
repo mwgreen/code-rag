@@ -5,6 +5,7 @@ stale removal, verify/reconcile drift repair without re-embedding, concurrent
 writers, clear.
 """
 
+import json
 import os
 import shutil
 import sqlite3
@@ -82,6 +83,31 @@ class PipelineTest(unittest.TestCase):
         return sqlite3.connect(fts_hybrid.FTSIndex.db_path(self.db))
 
     # -- tests --
+
+    def test_clear_recovers_from_embedding_dimension_mismatch(self):
+        """An index built by another embedder (different dimension) must be refused
+        by every normal access, and --clear must still be able to drop and rebuild
+        it: that is the recovery path for switching embedding models."""
+        self.index()
+        meta = Path(self.db).parent / "model_config.json"
+        stored = json.loads(meta.read_text())
+        stored.update(embed_dim=_env.DIM * 2, embed_model_path="/models/previous-embedder")
+        meta.write_text(json.dumps(stored))
+        desc_cache = Path(self.db).parent / "descriptions.db"
+        sqlite3.connect(desc_cache).close()  # stand-in for a populated description cache
+        rag_milvus._evict_client(self.db)  # forget the prepared state, as a restart would
+
+        with self.assertRaisesRegex(RuntimeError, "dimension mismatch"):
+            rag_milvus.search("jwt", n=1, db_path=self.db)
+
+        rag_milvus.clear_collection(db_path=self.db)
+        self.assertFalse(meta.exists(), "stale model_config.json must go with the index")
+        self.assertTrue(desc_cache.exists(), "description cache is embedder-independent; keep it")
+
+        stats = self.index()
+        self.assertEqual(stats["files_indexed"], 3)
+        self.assertTrue(rag_milvus.search("jwt bearer token authentication", n=1, db_path=self.db))
+        self.assertEqual(json.loads(meta.read_text())["embed_dim"], _env.DIM)
 
     def test_reopen_existing_index_loads_collection(self):
         """A fresh client on an existing DB must load the collection before use.

@@ -101,7 +101,7 @@ if [ -f "$MODEL_DIR/model.safetensors" ] || [ -f "$MODEL_DIR/model-00001-of-0000
     echo "Select it with:  export CODE_RAG_EMBED_MODEL=$MODEL_KEY"
     echo "(or CODE_RAG_PROFILE; with nothing set, the best downloaded model is used)"
     echo ""
-    echo "Note: switching embedding models requires re-indexing: ./index.sh --force /path/to/project"
+    echo "Note: switching embedding models requires re-indexing: ./index.sh /path/to/project --clear"
 else
     echo ""
     echo "Error: model weights not found after conversion."

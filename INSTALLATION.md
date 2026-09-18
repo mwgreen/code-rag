@@ -73,7 +73,7 @@ venv/bin/python model_config.py    # confirm what resolved
 
 Both downloads are one-time and need network access; at runtime the server forces `HF_HUB_OFFLINE=1`.
 Moving from another machine: copying `models/` over works, but per-project indexes under
-`{project}/.code-rag/` must be rebuilt if the embedding model changed (`./index.sh --force`).
+`{project}/.code-rag/` must be rebuilt if the embedding model changed (`./index.sh /path/to/project --clear`).
 
 ## Claude Code Configuration
 
