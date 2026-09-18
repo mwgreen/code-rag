@@ -83,6 +83,22 @@ class PipelineTest(unittest.TestCase):
 
     # -- tests --
 
+    def test_reopen_existing_index_loads_collection(self):
+        """A fresh client on an existing DB must load the collection before use.
+        Every server restart takes this path; Milvus Lite opens existing
+        collections in the 'released' state, so search/query fail until load()."""
+        self.index()
+        # Simulate a fresh server process: a new Milvus Lite backend opens an existing
+        # collection 'released'. In-process, closing the client alone reconnects to the
+        # same backend with the collection still loaded, so release it explicitly first.
+        rag_milvus._persistent_client(self.db).release_collection(rag_milvus.COLLECTION_NAME)
+        rag_milvus._evict_client(self.db)  # close the client; the next call reopens the DB
+
+        results = rag_milvus.search("jwt bearer token authentication", n=3, db_path=self.db)
+        self.assertTrue(results)
+        self.assertTrue(results[0]["path"].endswith("JwtAuthenticationService.java"))
+        self.assertIsInstance(rag_milvus.get_stats(db_path=self.db), dict)
+
     def test_index_search_and_score_semantics(self):
         stats = self.index()
         self.assertEqual(stats["files_indexed"], 3)

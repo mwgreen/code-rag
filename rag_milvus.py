@@ -325,6 +325,12 @@ def _ensure_collection(client: MilvusClient) -> None:
         logger.info("Creating Milvus collection %s (dim=%d)", COLLECTION_NAME, dim)
         client.create_collection(collection_name=COLLECTION_NAME, dimension=dim, metric_type="COSINE",
                                  consistency_level="Strong")
+        return  # create_collection() leaves the new collection loaded
+    # An existing collection opens in the "released" state on a fresh client
+    # (pymilvus 3 / Milvus Lite): every search/query/get fails with
+    # "Collection 'codebase' is in state 'released'; call load() before search"
+    # until it is loaded. This is the path every server restart takes.
+    client.load_collection(COLLECTION_NAME)
 
 
 def _write_model_config(meta_path: Path) -> None:
