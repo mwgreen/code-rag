@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
+load_dotenv()  # before importing codechunk_wrapper, which reads CODE_RAG_NODE / CODE_RAG_CHUNKER_TIMEOUT at import
 import yaml
 
 import codechunk_wrapper
@@ -24,9 +25,6 @@ try:
 except ImportError:
     AST_AVAILABLE = False
     chunk_code_ast = None
-
-# Load environment variables
-load_dotenv()
 
 # Configuration
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "3000"))

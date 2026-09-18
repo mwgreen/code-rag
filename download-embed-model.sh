@@ -59,7 +59,26 @@ echo ""
 
 # Allow network for this one-off download; the server forces offline mode.
 env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE "$PYTHON" -c "
-from mlx_embeddings.utils import convert
+try:
+    from mlx_embeddings import convert            # mlx-embeddings >= 0.1.0
+except ImportError:
+    from mlx_embeddings.utils import convert      # mlx-embeddings 0.0.x
+
+# mlx-embeddings 0.1.0 copies *.json out of the HF cache with shutil.copy, which
+# preserves the cache's read-only mode; tokenizer.save_pretrained() then fails with
+# 'Permission denied' overwriting tokenizer.json and config.json (with the
+# quantization block) is never written. Copy file contents only, never mode bits.
+import shutil
+from pathlib import Path
+def _copy_writable(src, dst, *args, **kwargs):
+    dst = Path(dst)
+    if dst.is_dir():
+        dst = dst / Path(src).name
+    if dst.exists():
+        dst.chmod(0o644)
+    shutil.copyfile(src, dst)
+    return str(dst)
+shutil.copy = _copy_writable
 
 print('Downloading and quantizing (Q8, group_size=64)...')
 convert(
