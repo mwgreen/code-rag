@@ -1,0 +1,18 @@
+# Code-RAG dependencies for the Bedrock backend (CODE_RAG_BACKEND=bedrock), e.g. on Linux.
+# Same as requirements.txt without the MLX stack (mlx, mlx-embeddings, mlx-lm, transformers),
+# plus boto3. Embeddings and descriptions run on Amazon Bedrock; nothing is loaded locally.
+
+pymilvus[milvus-lite]>=2.6.0,!=2.6.10  # 2.6.10 breaks unix socket address for milvus-lite
+setuptools>=70.0,<82.0  # provides pkg_resources needed by milvus-lite (removed in setuptools 82+)
+
+boto3>=1.35
+
+tree-sitter>=0.25.0
+tree-sitter-java>=0.23.0
+tree-sitter-python>=0.25.0
+tree-sitter-typescript>=0.23.0
+
+watchdog>=4.0.0  # inotify on Linux
+python-dotenv>=1.0.0
+pyyaml>=6.0
+mcp>=1.0.0,<2.0

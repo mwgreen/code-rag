@@ -52,6 +52,8 @@ def fake_embed(texts):
 
 def install_fake_embedder():
     import rag_milvus
+    if not hasattr(rag_milvus, "_real_embed_texts"):
+        rag_milvus._real_embed_texts = rag_milvus.embed_texts  # for tests of the real dispatch
     rag_milvus.embed_texts = fake_embed
     return rag_milvus
 

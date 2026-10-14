@@ -33,7 +33,7 @@ async def main():
 
     # Pre-load only the MLX model (not the DB client, which would lock the file)
     try:
-        await asyncio.to_thread(rag_milvus.get_mlx_model)
+        await asyncio.to_thread(rag_milvus.load_embedding_model)
         logger.info("Model loaded; DB opens on first search.")
     except Exception as e:
         logger.warning("Could not pre-load model: %s. First search will be slow.", e)

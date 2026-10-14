@@ -1,7 +1,15 @@
 """
 Model registry and resolution for code-rag.
 
-Two models are configurable:
+Backend (CODE_RAG_BACKEND): "mlx" (default; Apple Silicon, local models) or
+"bedrock" (Amazon Bedrock; for machines without MLX, e.g. Linux). With bedrock:
+  CODE_RAG_BEDROCK_EMBED_MODEL  us.cohere.embed-v4:0 (default) | amazon.titan-embed-text-v2:0
+  CODE_RAG_BEDROCK_EMBED_DIM    output dimension (default 1024)
+  CODE_RAG_BEDROCK_DESC_MODEL   us.amazon.nova-micro-v1:0 (default) |
+                                us.anthropic.claude-haiku-4-5-20251001-v1:0
+and nothing below about local models applies.
+
+Two models are configurable on the mlx backend:
   - Embedding model (mlx-embeddings): turns code/text chunks and queries into vectors.
   - Description model (mlx-lm): writes one-sentence NL summaries of code chunks.
 
@@ -173,6 +181,38 @@ PROFILES: Dict[str, dict] = {
 DEFAULT_PROFILE = "high"
 
 
+# --- Backend ---
+
+BACKENDS = ("mlx", "bedrock")
+
+
+def resolve_backend() -> str:
+    name = os.getenv("CODE_RAG_BACKEND", "").strip().lower() or "mlx"
+    if name not in BACKENDS:
+        raise ValueError(f"Unknown CODE_RAG_BACKEND={name!r}. Choose from: {', '.join(BACKENDS)}")
+    return name
+
+
+def resolve_bedrock_embed_model() -> str:
+    import bedrock_backend
+    model_id = os.getenv("CODE_RAG_BEDROCK_EMBED_MODEL", "").strip() or bedrock_backend.DEFAULT_EMBED_MODEL
+    bedrock_backend.embed_model_spec(model_id)  # validate
+    return model_id
+
+
+def resolve_bedrock_embed_dim() -> int:
+    import bedrock_backend
+    return bedrock_backend.resolve_embed_dim(resolve_bedrock_embed_model(),
+                                             os.getenv("CODE_RAG_BEDROCK_EMBED_DIM", "").strip() or None)
+
+
+def resolve_bedrock_description_model() -> str:
+    import bedrock_backend
+    model_id = (os.getenv("CODE_RAG_BEDROCK_DESC_MODEL", "").strip()
+                or bedrock_backend.DEFAULT_DESCRIPTION_MODEL)
+    return bedrock_backend.check_model_id(model_id)
+
+
 # --- Helpers ---
 
 def _profile() -> Optional[str]:
@@ -280,9 +320,20 @@ def query_instruction_for_model(model_path: str) -> str:
 
 def summary() -> dict:
     """Resolved configuration, for /health and the CLI."""
+    if resolve_backend() == "bedrock":
+        import bedrock_backend
+        return {
+            "backend": "bedrock",
+            "region": bedrock_backend.region(),
+            "profile": "bedrock",
+            "embed_model": resolve_bedrock_embed_model(),
+            "embed_dim": resolve_bedrock_embed_dim(),
+            "description_model": resolve_bedrock_description_model(),
+        }
     embed_key = resolve_embed_model_key()
     desc_key = resolve_description_model_key()
     return {
+        "backend": "mlx",
         "profile": _profile() or "auto",
         "embed_model_key": embed_key,
         "embed_model_path": resolve_embed_model_path(),
@@ -324,6 +375,12 @@ def _main(argv: List[str]) -> int:
         return 0
 
     s = summary()
+    if s["backend"] == "bedrock":
+        print("Resolved configuration (CODE_RAG_BACKEND=bedrock)")
+        print(f"  region:             {s['region']}")
+        print(f"  embedding model:    {s['embed_model']}  ({s['embed_dim']} dims)")
+        print(f"  description model:  {s['description_model']}")
+        return 0
     print("Resolved configuration")
     print(f"  profile:            {s['profile']}")
     print(f"  embedding model:    {s['embed_model_key'] or '(EMBED_MODEL_PATH override)'}")

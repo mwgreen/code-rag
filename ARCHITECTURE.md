@@ -784,4 +784,4 @@ The vector database could similarly be abstracted:
 
 ### Cross-Platform Support
 
-Replacing MLX with a cross-platform embedding solution (ONNX Runtime, or cloud API) would enable Linux/Windows support at the cost of either performance (CPU-only inference) or privacy (cloud embeddings).
+Linux is supported through the Amazon Bedrock backend (`CODE_RAG_BACKEND=bedrock`, see README): `bedrock_backend.py` embeds with Cohere Embed v4 or Titan Text Embeddings V2 and writes descriptions with Nova Micro (or Claude Haiku) through the Converse API, and `rag_milvus` / `nl_descriptions` import MLX lazily so that path never loads it. The trade-off is the one expected of a cloud API: chunks leave the machine (to the account's Bedrock endpoint) and indexing is billed per token. The index identity (`model_config.json`) records backend, model and dimension, so an index is only ever searched with the model that built it. A local cross-platform option (ONNX Runtime) remains open.

@@ -14,7 +14,9 @@ import sys
 _configured = False
 
 _NOISY = ("pymilvus", "urllib3", "httpx", "httpcore", "grpc", "asyncio",
-          "watchdog", "uvicorn.access", "mcp", "sse_starlette", "milvus_lite")
+          "watchdog", "uvicorn.access", "mcp", "sse_starlette", "milvus_lite",
+          # botocore logs request bodies (chunk text) at DEBUG; keep it at WARNING.
+          "botocore", "boto3", "s3transfer")
 
 
 def configure_logging(level: str | None = None, stream=None) -> None:

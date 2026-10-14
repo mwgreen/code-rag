@@ -1,13 +1,16 @@
 """
 LLM-generated natural language descriptions for code chunks.
 
-Uses a local MLX LLM to generate one-sentence summaries of code chunks,
-improving semantic search by bridging the vocabulary gap between natural
-language queries and code.
+Uses a local MLX LLM (or, with CODE_RAG_BACKEND=bedrock, a Bedrock model through
+the Converse API) to generate one-sentence summaries of code chunks, improving
+semantic search by bridging the vocabulary gap between natural language queries
+and code.
 
 The model is resolved by model_config.py (default profile: Gemma 4 E4B via
 mlx-community/gemma-4-e4b-it-OptiQ-4bit). Override with CODE_RAG_DESCRIPTION_MODEL
 (any HF id), CODE_RAG_DESCRIPTION_MODEL_KEY (registry key) or CODE_RAG_PROFILE.
+On the bedrock backend: CODE_RAG_BEDROCK_DESC_MODEL (default us.amazon.nova-micro-v1:0),
+with up to CODE_RAG_BEDROCK_DESC_CONCURRENCY (default 8) requests in flight.
 
 Descriptions are cached in SQLite keyed by SHA256 of chunk content.
 On by default; disable with CODE_RAG_DESCRIPTIONS=0.
@@ -20,6 +23,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -34,8 +38,12 @@ logger = logging.getLogger("code-rag.descriptions")
 
 # --- Configuration ---
 
-MODEL_ID = model_config.resolve_description_model_id()
+BACKEND = model_config.resolve_backend()
+MODEL_ID = (model_config.resolve_bedrock_description_model() if BACKEND == "bedrock"
+            else model_config.resolve_description_model_id())
 MAX_GEN_TOKENS = 100
+BEDROCK_MAX_TOKENS = 80
+BEDROCK_CONCURRENCY = max(1, int(os.getenv("CODE_RAG_BEDROCK_DESC_CONCURRENCY", "8")))
 MAX_INPUT_CHARS = 2000
 MIN_CHUNK_CHARS = 100  # Skip tiny chunks (imports-only, trivial)
 
@@ -54,6 +62,7 @@ One-sentence summary:"""
 
 _model = None
 _tokenizer = None
+_bedrock = None  # bedrock_backend.BedrockGenerator, created on first use
 _last_used = 0.0
 _idle_thread: Optional[threading.Thread] = None
 
@@ -87,6 +96,8 @@ def load_model():
     on subsequent calls instead of retrying the load for every chunk.
     """
     global _model, _tokenizer, _model_load_failed, _last_used
+    if BACKEND == "bedrock":
+        return _bedrock_generator(), None
     if _model is not None:
         _last_used = time.time()
         return _model, _tokenizer
@@ -120,13 +131,26 @@ def load_model():
     return _model, _tokenizer
 
 
+def _bedrock_generator():
+    global _bedrock
+    if _bedrock is None:
+        import bedrock_backend
+        _bedrock = bedrock_backend.BedrockGenerator(MODEL_ID, max_tokens=BEDROCK_MAX_TOKENS, temperature=0.0)
+        logger.info("NL descriptions with Bedrock %s", MODEL_ID)
+    return _bedrock
+
+
 def is_loaded() -> bool:
+    if BACKEND == "bedrock":
+        return _bedrock is not None
     return _model is not None
 
 
 def start_idle_unloader(idle_seconds: Optional[float] = None) -> None:
     """Start the background thread that unloads the model after idle_seconds without use."""
     global _idle_thread
+    if BACKEND == "bedrock":
+        return  # nothing is resident
     idle = IDLE_UNLOAD_SECONDS if idle_seconds is None else idle_seconds
     if idle <= 0 or (_idle_thread is not None and _idle_thread.is_alive()):
         return
@@ -194,11 +218,25 @@ def clean_description(text: str) -> str:
 
 def generate_description(code: str) -> str:
     """Generate a one-sentence NL description for a code chunk."""
+    global _last_used, _model_load_failed
+
+    prompt = PROMPT_TEMPLATE.format(code=code[:MAX_INPUT_CHARS])
+    if BACKEND == "bedrock":
+        try:
+            return clean_description(_bedrock_generator().generate(prompt))
+        except Exception as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("AccessDeniedException", "ResourceNotFoundException") and not _model_load_failed:
+                # Permanent (model not granted or not enabled for the account): stop asking.
+                _model_load_failed = True
+                logger.warning("Bedrock %s refused (%s). Disabling NL descriptions for this process. "
+                               "Set CODE_RAG_BEDROCK_DESC_MODEL to a model this role can invoke, "
+                               "or CODE_RAG_DESCRIPTIONS=0.", MODEL_ID, code)
+            raise
+
     from mlx_lm import generate
-    global _last_used
 
     model, tokenizer = load_model()
-    prompt = PROMPT_TEMPLATE.format(code=code[:MAX_INPUT_CHARS])
 
     if hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -322,17 +360,31 @@ def describe_chunks(chunks: List[Dict], db_path: str) -> List[Optional[str]]:
             len(chunks) - len(to_generate) - cache_hits
         )
 
-        for idx in to_generate:
-            content = chunks[idx]["content"]
-            try:
-                desc = generate_description(content)
-                if not desc:
-                    logger.debug("Empty description for chunk %d, not cached", idx)
-                    continue
-                descriptions[idx] = desc
-                put_cached(cache_conn, _content_hash(content), desc)
-            except Exception as e:
-                logger.warning("Description generation failed for chunk %d: %s", idx, e)
+        def store(idx: int, desc: str) -> None:
+            if not desc:
+                logger.debug("Empty description for chunk %d, not cached", idx)
+                return
+            descriptions[idx] = desc
+            put_cached(cache_conn, _content_hash(chunks[idx]["content"]), desc)
+
+        if BACKEND == "bedrock" and len(to_generate) > 1 and BEDROCK_CONCURRENCY > 1:
+            # Network-bound: run requests in parallel; the SQLite cache is only
+            # touched from this thread.
+            with ThreadPoolExecutor(max_workers=min(BEDROCK_CONCURRENCY, len(to_generate)),
+                                    thread_name_prefix="bedrock-desc") as pool:
+                futures = {pool.submit(generate_description, chunks[i]["content"]): i for i in to_generate}
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        store(idx, fut.result())
+                    except Exception as e:
+                        logger.warning("Description generation failed for chunk %d: %s", idx, e)
+        else:
+            for idx in to_generate:
+                try:
+                    store(idx, generate_description(chunks[idx]["content"]))
+                except Exception as e:
+                    logger.warning("Description generation failed for chunk %d: %s", idx, e)
 
     cache_conn.close()
     return descriptions

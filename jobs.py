@@ -116,7 +116,7 @@ def start_job(kind: str, project_root: str, target: Callable[[Job], Any]) -> Job
 def start_index_job(project_root: str, db_path: str, path: Optional[str] = None,
                     full: bool = False, extensions: Optional[List[str]] = None,
                     clear: bool = False) -> Job:
-    import rag_milvus  # local import: rag_milvus imports MLX, keep this module light
+    import rag_milvus  # local import: rag_milvus is heavy (Milvus, models), keep this module light
 
     def target(job: Job):
         if clear:
