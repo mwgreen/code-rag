@@ -181,6 +181,52 @@ class RetryTests(BedrockTestCase):
         self.assertEqual(len(self.sleeps), 2)
 
 
+class ResumeTests(BedrockTestCase):
+    """After sleep/hibernation the pooled connections are dead: the client is replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"wall": 1000.0, "mono": 50.0}
+        self.made = []
+        self.saved = (bb._wall, bb._mono, bb.make_client)
+        bb._wall = lambda: self.clock["wall"]
+        bb._mono = lambda: self.clock["mono"]
+
+        def factory(max_pool_connections=16):
+            self.made.append(StubBedrock())
+            return self.made[-1]
+        bb.make_client = factory
+
+    def tearDown(self):
+        bb._wall, bb._mono, bb.make_client = self.saved
+        super().tearDown()
+
+    def advance(self, wall, mono):
+        self.clock["wall"] += wall
+        self.clock["mono"] += mono
+
+    def test_client_replaced_after_suspend_only(self):
+        emb = bb.BedrockEmbedder("us.cohere.embed-v4:0", dim=256)
+        emb.embed(["a"])
+        self.advance(wall=600, mono=600)          # idle but awake: keep the client
+        emb.embed(["b"])
+        self.assertEqual(len(self.made), 1)
+        self.advance(wall=3600 * 12, mono=2)      # hibernated overnight
+        with self.assertLogs("bedrock", level="INFO") as logs:
+            emb.embed(["c"])
+        self.assertEqual(len(self.made), 2)
+        self.assertIn("reconnecting", "\n".join(logs.output))
+        self.assertEqual(len(self.made[1].invocations), 1)
+
+    def test_injected_client_is_never_replaced(self):
+        stub = StubBedrock()
+        gen = bb.BedrockGenerator("us.amazon.nova-micro-v1:0", client=stub)
+        gen.generate("x")
+        self.advance(wall=3600, mono=1)
+        gen.generate("y")
+        self.assertEqual((len(stub.converse_calls), self.made), (2, []))
+
+
 class GeneratorTests(BedrockTestCase):
     def test_converse_request_and_usage(self):
         stub = StubBedrock()
