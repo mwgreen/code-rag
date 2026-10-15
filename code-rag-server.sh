@@ -7,7 +7,15 @@
 #   - stale-port cleanup only ever targets a LISTENING http_server.py process,
 #     never client connections (the old `lsof -ti :PORT` matched those too)
 #
-# Usage: ./code-rag-server.sh [start|stop|status|restart|logs]
+# Linux: `install-systemd` installs a systemd --user service (code-rag.service)
+# that starts at boot (with `loginctl enable-linger $USER`) and restarts on
+# failure. Once it is installed, start/stop/status/restart/logs go through
+# systemctl/journalctl and the watchdog below is not used. The service reads
+# ~/.config/code-rag.env (e.g. CODE_RAG_BACKEND=bedrock) and always binds 127.0.0.1.
+# Without the service (macOS, or Linux before install-systemd) the launcher runs
+# the server itself as before, reading ~/.config/code-rag.env if it exists.
+#
+# Usage: ./code-rag-server.sh [start|stop|status|restart|logs [n]|install-systemd|uninstall-systemd]
 
 set -euo pipefail
 
@@ -26,6 +34,9 @@ WATCHDOG_INTERVAL=30
 WATCHDOG_MAX_FAILURES=6                           # 3 minutes of consecutive failures
 LOG_MAX_BYTES=$((20 * 1024 * 1024))
 LOG_KEEP=3
+ENV_FILE="${CODE_RAG_ENV_FILE:-$HOME/.config/code-rag.env}"
+SYSTEMD_UNIT="code-rag.service"
+SYSTEMD_UNIT_FILE="$HOME/.config/systemd/user/$SYSTEMD_UNIT"
 
 mkdir -p "$SERVER_DIR"
 
@@ -47,10 +58,20 @@ is_alive() {
 
 is_healthy() { curl -sf --max-time "$HEALTH_TIMEOUT" "$HEALTH_URL" >/dev/null 2>&1; }
 
-listener_pids() { lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true; }
+listener_pids() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true
+    else
+        ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true
+    fi
+}
+
+# BSD stat (macOS) and GNU stat (Linux) take different flags.
+file_size()  { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
+file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || date +%s; }
 
 rotate_log() {
-    if [ -f "$LOG_FILE" ] && [ "$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)" -ge "$LOG_MAX_BYTES" ]; then
+    if [ -f "$LOG_FILE" ] && [ "$(file_size "$LOG_FILE")" -ge "$LOG_MAX_BYTES" ]; then
         local i
         for (( i=LOG_KEEP-1; i>=1; i-- )); do
             [ -f "$LOG_FILE.$i" ] && mv -f "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"
@@ -64,7 +85,7 @@ acquire_lock() {
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         # Stale lock (older than 5 minutes) from a killed start: remove it.
         if [ -d "$LOCK_DIR" ]; then
-            local age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || date +%s) ))
+            local age=$(( $(date +%s) - $(file_mtime "$LOCK_DIR") ))
             if [ "$age" -gt 300 ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; continue; fi
         fi
         sleep 1
@@ -97,8 +118,18 @@ clear_port() {
     done
 }
 
+load_env_file() {
+    if [ -f "$ENV_FILE" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$ENV_FILE"
+        set +a
+    fi
+}
+
 launch_server() {
     rotate_log
+    load_env_file
     export PYTHONPATH="$SCRIPT_DIR"
     nohup "$PYTHON" -u "$SCRIPT_DIR/http_server.py" </dev/null >> "$LOG_FILE" 2>&1 &
     local spid=$!
@@ -224,11 +255,107 @@ do_status() {
     fi
 }
 
+# --- systemd --user (Linux) ---
+
+systemd_installed() { [ "$(uname -s)" = "Linux" ] && [ -f "$SYSTEMD_UNIT_FILE" ]; }
+
+print_health() {
+    curl -s --max-time "$HEALTH_TIMEOUT" "$HEALTH_URL" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); [print(f"  {k}: {v}") for k,v in d.items() if k not in ("watchers","active_jobs","chunker")]; print("  chunker:", d.get("chunker",{}).get("active"), "|", d.get("chunker",{}).get("node")); [print(f"  watcher {k}: {v}") for k,v in d.get("watchers",{}).items()]; [print(f"  job: {j}") for j in d.get("active_jobs",[])]' 2>/dev/null || true
+}
+
+systemd_wait_healthy() {
+    local waited=0
+    while [ "$waited" -lt "$START_TIMEOUT" ]; do
+        if is_healthy; then log "Server ready (systemd $SYSTEMD_UNIT)"; return 0; fi
+        local state; state=$(systemctl --user show -p ActiveState --value "$SYSTEMD_UNIT" 2>/dev/null)
+        if [ "$state" != "active" ] && [ "$state" != "activating" ] && [ "$state" != "reloading" ]; then
+            log "$SYSTEMD_UNIT is not running. Last log lines:"
+            journalctl --user -u "$SYSTEMD_UNIT" -n 20 --no-pager >&2 || true
+            return 1
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    log "Not healthy after ${START_TIMEOUT}s; see: $0 logs"
+    return 1
+}
+
+write_systemd_unit() {
+    mkdir -p "$(dirname "$SYSTEMD_UNIT_FILE")"
+    cat > "$SYSTEMD_UNIT_FILE" << UNITEOF
+# Installed by $SCRIPT_DIR/code-rag-server.sh install-systemd
+[Unit]
+Description=code-rag MCP server (127.0.0.1:$PORT)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+# Optional settings (CODE_RAG_BACKEND=bedrock, models, CODE_RAG_NODE, ...).
+EnvironmentFile=-$ENV_FILE
+Environment=PYTHONPATH=$SCRIPT_DIR
+Environment=GRPC_VERBOSITY=ERROR
+# Host and port are set on the command line so the env file cannot override them:
+# the server must only ever listen on loopback.
+ExecStart=/usr/bin/env CODE_RAG_HOST=127.0.0.1 CODE_RAG_PORT=$PORT $PYTHON -u $SCRIPT_DIR/http_server.py
+Restart=on-failure
+RestartSec=10
+# Lets an in-flight index batch finish its write (uvicorn graceful shutdown is 30s).
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+UNITEOF
+}
+
+do_install_systemd() {
+    [ "$(uname -s)" = "Linux" ] || { log "install-systemd is for Linux; on macOS use start (hooks)"; exit 1; }
+    do_stop   # a launcher-managed server and its watchdog would hold the port
+    write_systemd_unit
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$SYSTEMD_UNIT"
+    log "Installed $SYSTEMD_UNIT_FILE (enabled)."
+    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+        log "Note: run 'loginctl enable-linger $USER' so the service starts at boot without a login."
+    fi
+    systemd_wait_healthy
+}
+
+do_uninstall_systemd() {
+    systemctl --user disable --now "$SYSTEMD_UNIT" 2>/dev/null || true
+    rm -f "$SYSTEMD_UNIT_FILE"
+    systemctl --user daemon-reload
+    log "Removed $SYSTEMD_UNIT."
+}
+
+if systemd_installed; then
+    case "${1:-start}" in
+        start)
+            if systemctl --user is-active --quiet "$SYSTEMD_UNIT" && is_healthy; then
+                log "Already running (systemd $SYSTEMD_UNIT, PID $(systemctl --user show -p MainPID --value "$SYSTEMD_UNIT"))"
+                exit 0
+            fi
+            systemctl --user start "$SYSTEMD_UNIT"; systemd_wait_healthy ;;
+        stop)    systemctl --user stop "$SYSTEMD_UNIT"; log "Stopped (systemd $SYSTEMD_UNIT)." ;;
+        restart) systemctl --user restart "$SYSTEMD_UNIT"; systemd_wait_healthy ;;
+        status)
+            systemctl --user --no-pager status "$SYSTEMD_UNIT" | head -n 5 >&2 || true
+            if is_healthy; then print_health; else log "Not answering /health"; exit 2; fi ;;
+        logs)    journalctl --user -u "$SYSTEMD_UNIT" -n "${2:-50}" --no-pager ;;
+        install-systemd)   do_install_systemd ;;
+        uninstall-systemd) do_uninstall_systemd ;;
+        *) echo "Usage: $0 {start|stop|status|restart|logs [n]|install-systemd|uninstall-systemd}" >&2; exit 1 ;;
+    esac
+    exit $?
+fi
+
 case "${1:-start}" in
     start)   do_start ;;
     stop)    do_stop ;;
     status)  do_status ;;
     restart) do_stop; do_start ;;
     logs)    tail -n "${2:-50}" "$LOG_FILE" ;;
-    *)       echo "Usage: $0 {start|stop|status|restart|logs [n]}" >&2; exit 1 ;;
+    install-systemd)   do_install_systemd ;;
+    uninstall-systemd) do_uninstall_systemd ;;
+    *)       echo "Usage: $0 {start|stop|status|restart|logs [n]|install-systemd|uninstall-systemd}" >&2; exit 1 ;;
 esac

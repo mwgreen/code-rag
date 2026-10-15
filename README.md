@@ -55,6 +55,57 @@ cd code-rag
 - Python 3.12+
 - Node.js 18+ (for code-chunk semantic chunking)
 
+## Linux / Amazon Bedrock backend
+
+MLX only exists on Apple Silicon. On Linux (or anywhere without MLX) set
+`CODE_RAG_BACKEND=bedrock` and the embeddings and chunk descriptions run on
+Amazon Bedrock instead; nothing is loaded locally and MLX is never imported.
+The Mac default (`mlx`) is unchanged.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `CODE_RAG_BACKEND` | `mlx` | `mlx` or `bedrock` |
+| `CODE_RAG_BEDROCK_EMBED_MODEL` | `us.cohere.embed-v4:0` | or `amazon.titan-embed-text-v2:0`. Cohere v4 must be called through the `us.` inference profile. |
+| `CODE_RAG_BEDROCK_EMBED_DIM` | `1024` | Cohere: 256/512/1024/1536. Titan: 256/512/1024. |
+| `CODE_RAG_BEDROCK_DESC_MODEL` | `us.amazon.nova-micro-v1:0` | or `us.anthropic.claude-haiku-4-5-20251001-v1:0` (Converse API, maxTokens 80, temperature 0) |
+| `CODE_RAG_BEDROCK_DESC_CONCURRENCY` | `8` | description requests in flight while indexing |
+| `BEDROCK_EMBED_CONCURRENCY` | `8` | Titan only (one text per call); Cohere sends up to 96 texts per call |
+| `AWS_REGION` | `us-west-2` | credentials come from boto3's default chain (instance role, SSO, ...) |
+
+Throttling / ServiceUnavailable / ModelNotReady are retried with exponential
+backoff and full jitter; over-long texts are truncated with a warning. The text
+being embedded or described is never logged. `/health` reports `backend`,
+`embed_model`, `embed_dim`, `description_model` and per-model `bedrock_usage`
+(calls, texts, input/output tokens, retries).
+
+The index records which backend, model and dimension built it
+(`.code-rag/model_config.json`). A server using a different one refuses that
+project's index with a "reindex" message (`./index.sh <project> --clear`):
+vectors from different models are never mixed.
+
+Setup (no pip on the box? use [uv](https://docs.astral.sh/uv/)):
+
+```bash
+uv venv --python 3.12 venv && uv pip install --python venv/bin/python -r requirements-bedrock.txt
+npm install
+cat > ~/.config/code-rag.env <<'ENV'
+CODE_RAG_BACKEND=bedrock
+CODE_RAG_BEDROCK_EMBED_MODEL=us.cohere.embed-v4:0
+CODE_RAG_BEDROCK_DESC_MODEL=us.amazon.nova-micro-v1:0
+AWS_REGION=us-west-2
+# A stable node path for the AST chunker (fnm's per-shell PATH is not visible to systemd)
+CODE_RAG_NODE=/home/you/.local/share/fnm/aliases/default/bin/node
+ENV
+loginctl enable-linger "$USER"        # start user services at boot
+./code-rag-server.sh install-systemd  # systemd --user unit, 127.0.0.1:7101 only
+./index.sh /path/to/project
+```
+
+With the unit installed, `./code-rag-server.sh start|stop|restart|status|logs`
+go through `systemctl --user` / `journalctl`. Tests: `./run-tests.sh` (stubbed
+Bedrock client); `RUN_BEDROCK_IT=1 ./run-tests.sh -k Integration` calls the
+real service.
+
 ## Documentation
 
 - **USAGE.md** — How to configure, index, search, and troubleshoot

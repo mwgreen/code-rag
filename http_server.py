@@ -93,6 +93,8 @@ class ProjectMiddleware:
 # --- HTTP endpoints ---
 
 def _gpu_memory_mb() -> float | None:
+    if rag_milvus.BACKEND != "mlx":
+        return None
     try:
         import mlx.core as mx
         fn = getattr(mx, "get_active_memory", None)
@@ -119,8 +121,9 @@ async def health(request: Request) -> JSONResponse:
         "status": "ok",
         "uptime_s": round(time.time() - _started_at, 1),
         "pid": os.getpid(),
+        "backend": rag_milvus.BACKEND,
         "model": _model_loaded,
-        "embed_model": Path(rag_milvus._MODEL_PATH).name if _model_loaded else None,
+        "embed_model": _embed_model_label() if _model_loaded else None,
         "embed_dim": rag_milvus._EMBED_DIM,
         "embed_max_tokens": rag_milvus.EMBED_MAX_TOKENS,
         "description_model": nl_descriptions.MODEL_ID if nl_descriptions.is_enabled() else None,
@@ -132,7 +135,21 @@ async def health(request: Request) -> JSONResponse:
         "watchers": watchers,
         "active_jobs": active_jobs,
         "last_error": _last_error,
+        **_bedrock_health(),
     })
+
+
+def _embed_model_label() -> str:
+    if rag_milvus.BACKEND == "bedrock":
+        return rag_milvus.embed_model_name()
+    return Path(rag_milvus._MODEL_PATH).name
+
+
+def _bedrock_health() -> dict:
+    if rag_milvus.BACKEND != "bedrock":
+        return {}
+    import bedrock_backend
+    return {"bedrock_region": bedrock_backend.region(), "bedrock_usage": bedrock_backend.USAGE.snapshot()}
 
 
 def _project_root_from(request: Request, body: dict) -> str | None:
@@ -195,7 +212,7 @@ async def lifespan(app: Starlette):
     logger.info("Chunker: %s", json.dumps(chunking.chunker_status()))
 
     try:
-        await asyncio.to_thread(rag_milvus.get_mlx_model)
+        await asyncio.to_thread(rag_milvus.load_embedding_model)
         _model_loaded = True
     except Exception as e:
         logger.error("Could not pre-load embedding model: %s", e)

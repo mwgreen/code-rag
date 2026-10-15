@@ -1,5 +1,5 @@
 """
-RAG with Milvus Lite + MLX embeddings.
+RAG with Milvus Lite + MLX embeddings (or Amazon Bedrock with CODE_RAG_BACKEND=bedrock).
 
 Each project gets its own DB file at {project_root}/.code-rag/milvus.db.
 The HTTP server shares the MLX model across projects and caches Milvus clients per DB.
@@ -42,14 +42,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 from pymilvus import MilvusClient, MilvusException
-from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 
 # pymilvus installs its own logging config at import time, which would undo any
 # level set earlier. Its query_iterator warns on every call against milvus-lite
 # ("failed to get mvccTs"), a known harmless limitation of the embedded server.
 for _name in ("pymilvus", "pymilvus.orm.iterator"):
     logging.getLogger(_name).setLevel(logging.ERROR)
-import mlx.core as mx
 
 from mlx_gpu import GPU
 import model_config
@@ -64,11 +62,21 @@ from fts_hybrid import FTSIndex, rrf_merge
 logger = logging.getLogger("code-rag.milvus")
 
 # --- Embedding model configuration ---
-# Resolved by model_config.py: EMBED_MODEL_PATH > CODE_RAG_EMBED_MODEL >
+# Backend: CODE_RAG_BACKEND=mlx (default) or bedrock. MLX is imported lazily, so the
+# bedrock backend never loads it (and works where MLX does not exist).
+# mlx: resolved by model_config.py: EMBED_MODEL_PATH > CODE_RAG_EMBED_MODEL >
 # CODE_RAG_PROFILE > first downloaded model > default profile (Qwen3-Embedding-4B).
+# bedrock: CODE_RAG_BEDROCK_EMBED_MODEL / CODE_RAG_BEDROCK_EMBED_DIM.
 _SCRIPT_DIR = Path(__file__).parent
-_MODEL_PATH = model_config.resolve_embed_model_path()
-_EMBED_DIM = None  # Auto-detected from model config.json
+BACKEND = model_config.resolve_backend()
+if BACKEND == "bedrock":
+    _MODEL_PATH = None
+    _BEDROCK_MODEL = model_config.resolve_bedrock_embed_model()
+    _EMBED_DIM = model_config.resolve_bedrock_embed_dim()
+else:
+    _MODEL_PATH = model_config.resolve_embed_model_path()
+    _BEDROCK_MODEL = None
+    _EMBED_DIM = None  # Auto-detected from model config.json
 
 # Texts longer than this many tokens are truncated before embedding. mlx-embeddings
 # defaults to 512, which cut the method body out of most contextualized chunks
@@ -161,10 +169,38 @@ _mlx_model = None
 _mlx_tokenizer = None
 
 
+_bedrock_embedder = None
+
+
+def embed_model_name() -> str:
+    """The embedding model's identity: the Bedrock model ID, or the MLX model path."""
+    return _BEDROCK_MODEL if BACKEND == "bedrock" else _MODEL_PATH
+
+
+def get_bedrock_embedder():
+    global _bedrock_embedder
+    if _bedrock_embedder is None:
+        import bedrock_backend
+        _bedrock_embedder = bedrock_backend.BedrockEmbedder(_BEDROCK_MODEL, dim=_EMBED_DIM)
+        logger.info("Embedding with Bedrock %s (%d dims, region %s)", _BEDROCK_MODEL, _EMBED_DIM,
+                    bedrock_backend.region())
+    return _bedrock_embedder
+
+
+def load_embedding_model() -> None:
+    """Preload the embedding model (MLX), or set up the Bedrock client."""
+    if BACKEND == "bedrock":
+        get_bedrock_embedder()
+    else:
+        get_mlx_model()
+
+
 def get_mlx_model():
     """Get or load the MLX embedding model (one-time load, under the GPU lock)."""
     global _mlx_model, _mlx_tokenizer, _EMBED_DIM
 
+    if BACKEND != "mlx":
+        raise RuntimeError(f"get_mlx_model() called with CODE_RAG_BACKEND={BACKEND}")
     if _mlx_model is not None:
         return _mlx_model, _mlx_tokenizer
 
@@ -175,6 +211,8 @@ def get_mlx_model():
             f"or set CODE_RAG_PROFILE / CODE_RAG_EMBED_MODEL / EMBED_MODEL_PATH. "
             f"See `python model_config.py --list`."
         )
+
+    from mlx_embeddings.utils import load as mlx_load
 
     with GPU:
         if _mlx_model is not None:
@@ -208,6 +246,11 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     so a search query only ever waits for one batch."""
     if not texts:
         return []
+    if BACKEND == "bedrock":
+        return get_bedrock_embedder().embed(texts, input_type="search_document")
+    import mlx.core as mx
+    from mlx_embeddings.utils import generate as mlx_generate
+
     model, tokenizer = get_mlx_model()
     order = sorted(range(len(texts)), key=lambda i: len(texts[i]), reverse=True)
     out: List[Optional[List[float]]] = [None] * len(texts)
@@ -226,6 +269,8 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 def embed_query(query: str) -> List[float]:
     """Embed a search query, prepending the instruction prefix if the model uses one."""
+    if BACKEND == "bedrock":
+        return get_bedrock_embedder().embed([query], input_type="search_query")[0]
     instruction = _get_query_instruction()
     text = f"{instruction}{query}" if instruction else query
     return embed_texts([text])[0]
@@ -333,30 +378,59 @@ def _ensure_collection(client: MilvusClient) -> None:
     client.load_collection(COLLECTION_NAME)
 
 
+def _model_identity() -> Dict:
+    if BACKEND == "bedrock":
+        return {"backend": "bedrock", "embed_model": _BEDROCK_MODEL, "embed_dim": _get_embed_dim()}
+    # Older indexes have no "backend" key; they were all built with MLX.
+    return {"backend": "mlx", "embed_model_path": _MODEL_PATH, "embed_dim": _get_embed_dim()}
+
+
 def _write_model_config(meta_path: Path) -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     with open(meta_path, 'w') as f:
-        json.dump({"embed_model_path": _MODEL_PATH, "embed_dim": _get_embed_dim()}, f, indent=2)
+        json.dump(_model_identity(), f, indent=2)
+
+
+class ModelMismatchError(RuntimeError):
+    """The index was built with a different embedding backend, model or dimension."""
 
 
 def _check_model_consistency(db_path: str) -> None:
-    """Refuse to mix embedding dimensions in one index; record which model built it."""
+    """Refuse to mix vectors from different embedding models in one index; record
+    which model built it.
+
+    The backend, the dimension and (for Bedrock) the model ID must match. On the
+    MLX backend the stored model path is informational, as before: a moved or
+    re-downloaded model directory with the same dimension does not force a reindex.
+    """
     meta_path = Path(db_path).parent / "model_config.json"
-    current_dim = _get_embed_dim()
+    current = _model_identity()
     if not meta_path.exists():
         _write_model_config(meta_path)
         return
     with open(meta_path) as f:
         stored = json.load(f)
+    stored_backend = stored.get("backend", "mlx")
+    stored_model = stored.get("embed_model") or stored.get("embed_model_path") or "unknown"
     stored_dim = stored.get("embed_dim")
-    if stored_dim and stored_dim != current_dim:
-        raise RuntimeError(
-            f"Embedding dimension mismatch: index was built with {stored_dim}-dim embeddings "
-            f"(model: {stored.get('embed_model_path', 'unknown')}), but the current model produces "
-            f"{current_dim}-dim embeddings (model: {_MODEL_PATH}). "
+    current_model = embed_model_name()
+    problems = []
+    if stored_backend != BACKEND:
+        problems.append(f"backend {stored_backend} vs {BACKEND}")
+    elif BACKEND == "bedrock" and stored.get("embed_model") != _BEDROCK_MODEL:
+        problems.append(f"model {stored_model} vs {current_model}")
+    if stored_dim and stored_dim != current["embed_dim"]:
+        problems.append(f"dimension {stored_dim} vs {current['embed_dim']}")
+    if problems:
+        kind = "dimension" if any(x.startswith("dimension") for x in problems) else "model"
+        raise ModelMismatchError(
+            f"Embedding {kind} mismatch for {Path(db_path).parent.parent}: the index was built with "
+            f"{stored_backend} {stored_model} ({stored_dim} dims), but this server embeds with "
+            f"{BACKEND} {current_model} ({current['embed_dim']} dims) [{'; '.join(problems)}]. "
+            f"Vectors from different models cannot be mixed. "
             f"Re-index with: ./index.sh {Path(db_path).parent.parent} --clear"
         )
-    if stored.get("embed_model_path") != _MODEL_PATH:
+    if stored != current:
         _write_model_config(meta_path)
 
 
